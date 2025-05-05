@@ -1,4 +1,5 @@
-from ....configuration import PretrainedTitansConfig
+from ...configs import PretrainedTitansConfig
+from .....utils import logging
 
 
 logger = logging.get_logger(__name__)
