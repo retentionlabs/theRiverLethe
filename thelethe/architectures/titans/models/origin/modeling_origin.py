@@ -1,27 +1,29 @@
-from transformers.modeling_utils import PreTrainedModel
+from ...modelings import PreTrainedTitansModel
+from .configuration_origin import OriginConfig
 
 
-class OriginPreTrainedModel(PreTrainedModel):
-    pass
+class OriginPreTrainedTitansModel(PreTrainedTitansModel):
+    config_class = OriginConfig
 
 
-class OriginModel(OriginPreTrainedModel):
+class OriginModel(OriginPreTrainedTitansModel):
     """
     This is the base class for all Origin models.
-    It inherits from `PreTrainedModel` and provides the basic functionality for loading and saving model weights.
+    It inherits from `OriginPreTrainedTitansModel` and provides the basic functionality for loading and saving model weights.
     """
 
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.init_weights()  # Initialize weights using the method from PreTrainedModel
+        self.init_weights()  # Initialize weights using the method from PreTrainedTitansModel
 
 
-class OriginForCausalLM(OriginPreTrainedModel):
+class OriginForCausalLM(OriginPreTrainedTitansModel):
     """
     This is the base class for all Origin models used for causal language modeling.
-    It inherits from `OriginPreTrainedModel` and provides the basic functionality for loading and saving model weights.
+    It inherits from `OriginPreTrainedTitansModel` and provides the basic functionality for loading and saving model weights.
     """
+
     def __init__(self, config):
         super().__init__(config)
         self.config = config
