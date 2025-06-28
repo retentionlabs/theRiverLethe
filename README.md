@@ -11,7 +11,8 @@ AI models with adaptive memory management and strategic forgetting, inspired by 
 - **2019-09-29** [Test-time Training](https://arxiv.org/abs/1909.13231): Advanced the field by introducing methods for model adaptation during inference time without requiring complete retraining.
 - **2024-07-05** [TTT-Linear/MLP](https://arxiv.org/abs/2407.04620): Introduced as a Self-Attention alternative for Transformers, enabling automatic retention of input sequences by using Self-supervised learning.
 - **2024-12-31** [Titans Architecture](https://arxiv.org/abs/2501.00663): Established a novel memory-based architecture combining Transformer's short-term memory capabilities (Self-Attention) with MLP-based long-term memory, significantly improving performance on extended sequential tasks.
-- **2025-MM-DD** [Atlas Model]()
+- **2025-05-29** [Atlas Model](https://arxiv.org/abs/2505.23735): Introduced as an extension of the Titans Architecture, Atlas Model integrates a more complex memory management system, enhancing the model's ability to handle long-term dependencies and context retention.
+- **2025-MM-DD** [Cronos Model]()
 
 
 ## Overview
@@ -33,10 +34,16 @@ AI models with adaptive memory management and strategic forgetting, inspired by 
 
 <img src="./docs/image/atlas.png" width="50%">
 
-- Atlas Model proposes a combination of cognitive-scientific memory components.
+
+### Cronos Model
+- Cronos is a Titan in Greek mythology who is ...
+
+<img src="" width="50%">
+
+- Cronos Model proposes a combination of cognitive-scientific memory components.
   - Semantic Memory (Retrospective, Long-term Memory)
   - Episodic Memory (Retrospective, Long-term Memory)
   - Intentional Memory (Prospective, Long-term Memory)
   - Active Cognitive State (Working/Operational, Short-term Memory)
 
-<img src="./docs/image/atlas_memory.png" width="50%">
+<img src="./docs/image/cronos_memory.png" width="50%">
