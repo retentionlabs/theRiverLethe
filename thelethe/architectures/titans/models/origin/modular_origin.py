@@ -82,7 +82,6 @@ class TitansMultiHeadLayerNorm(TTTMultiHeadLayerNorm):
 class TitansMomentumBasedSurpriseGate(TTTDynamicLearningGate):
     def __init__(self, num_heads: int, head_dim: int, chunk_size: int, adapt_base_lr: float, momentum: float, weight_decay: float):
         super().__init__(num_heads, head_dim, chunk_size, adapt_base_lr)
-        del self.token_idx
 
         self.momentum = momentum
         self.weight_decay = weight_decay
@@ -95,7 +94,7 @@ class TitansMomentumBasedSurpriseGate(TTTDynamicLearningGate):
             [torch.normal(0, 0.02, size=target_shape_per_head) for _ in range(self.num_heads)],
             dim=0
         ))
-        self.alpha_bias = nn.Parameter(torch.stack(  # init bias to 0 following original JAX impl.
+        self.alpha_bias = nn.Parameter(torch.stack(
             [torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)],
             dim=0
         ).unsqueeze(-1))
@@ -104,7 +103,7 @@ class TitansMomentumBasedSurpriseGate(TTTDynamicLearningGate):
             [torch.normal(0, 0.02, size=target_shape_per_head) for _ in range(self.num_heads)],
             dim=0
         ))
-        self.theta_bias = nn.Parameter(torch.stack(  # init bias to 0 following original JAX impl.
+        self.theta_bias = nn.Parameter(torch.stack(
             [torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)],
             dim=0
         ).unsqueeze(-1))
@@ -113,7 +112,7 @@ class TitansMomentumBasedSurpriseGate(TTTDynamicLearningGate):
             [torch.normal(0, 0.02, size=target_shape_per_head) for _ in range(self.num_heads)],
             dim=0
         ))
-        self.eta_bias = nn.Parameter(torch.stack(  # init bias to 0 following original JAX impl.
+        self.eta_bias = nn.Parameter(torch.stack(
             [torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)],
             dim=0
         ).unsqueeze(-1))
@@ -123,6 +122,7 @@ class TitansMomentumBasedSurpriseGate(TTTDynamicLearningGate):
 
     def forward(self, x):
         current_mini_batch_size = x.shape[-2]
+        token_eta = token_idx.view(1, 1, current_mini_batch_size, 1)
 
         # Momentary Surprise (Current Input) [B, num_heads, mini_batch_size, 1]
         moment_surprise = torch.einsum("bhkc,hcd->bhkd", x, self.theta) + self.theta_bias.view(1, self.num_heads, 1, 1)
@@ -130,16 +130,16 @@ class TitansMomentumBasedSurpriseGate(TTTDynamicLearningGate):
         moment_surprise_eta = self.adapt_base_lr * moment_surprise / self.head_dim
 
         # Past Surprise [B, num_heads, mini_batch_size, 1]
-        past_surprise = torch.einsum("bhkc,hcd->bhkd", x, self.theta) + self.theta_bias.view(1, self.num_heads, 1, 1)
-        past_surprise = F.sigmoid(moment_surprise)
-        past_surprise_eta = self.adapt_base_lr * moment_surprise / self.head_dim
+        past_surprise = torch.einsum("bhkc,hcd->bhkd", x, self.eta) + self.eta_bias.view(1, self.num_heads, 1, 1)
+        past_surprise = F.sigmoid(past_surprise)
+        past_surprise_eta = self.adapt_base_lr * past_surprise / self.head_dim
 
         # Forget Gate [B, num_heads, mini_batch_size, 1]
-        forgetting = torch.einsum("bhkc,hcd->bhkd", x, self.theta) + self.theta_bias.view(1, self.num_heads, 1, 1)
-        forgetting = F.sigmoid(moment_surprise)
-        forgetting_eta = self.adapt_base_lr * moment_surprise / self.head_dim
+        forgetting = torch.einsum("bhkc,hcd->bhkd", x, self.alpha) + self.alpha_bias.view(1, self.num_heads, 1, 1)
+        forgetting = F.sigmoid(forgetting)
+        forgetting_eta = self.adapt_base_lr * forgetting / self.head_dim
 
-        return moment_surprise_eta, past_surprise_eta, forgetting_eta
+        return token_eta, moment_surprise_eta, past_surprise_eta, forgetting_eta
 
 
 class OriginMemory(TTTLinearMemory):
@@ -197,26 +197,31 @@ class OriginAdaptation(TTTLinearAdaptation):
     @staticmethod
     def step(carry, xs):  # TODO: write titans method below
         # Projected Inputs
-        # [B,nh,K,f], K=mini_batch_size
         XQ_mini_batch, XK_mini_batch, XV_mini_batch = xs.unbind(dim=2)
+        past_surprise = []
 
         # Reconstruction Task
-        # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f]
         _, reconstructed = carry(XK_mini_batch, output_hidden_states=True)
         reconstructed.insert(0, XK_mini_batch)
         reconstruction_target = XV_mini_batch
-        # token_eta: [1,1,K,1], lr_eta: [B,H,K,1]
-        token_eta, lr_eta = carry.lr_gate(XK_mini_batch)
-        eta_scalar = token_eta * lr_eta  # [B,h,K,1] * [B,h,K,1] -> [B,h,K,1] for backward
-        eta_matrix = token_eta @ lr_eta.transpose(-2, -1)  # [B,h,K,1] @ [B,h,K,1] -> [B,h,K,K] for hidden state update
-        gradients = carry.backward(reconstructed, reconstruction_target, eta=eta_scalar)
+
+        # Calculate Gradient
+        token_eta, momentary_eta, past_eta, forget_eta = carry.lr_gate(XK_mini_batch)
+        momentary_eta_scalar = token_eta * lr_eta
+        momentary_eta_matrix = token_eta @ lr_eta.transpose(-2, -1)
+        gradients = carry.backward(reconstructed, reconstruction_target, eta=momentary_eta_scalar)
+
+        # Associate Scan each mini-batch token for accumulative new surprise
+        momentary_surprise = gradients[-1]
+
+        new_surprise = past_eta * past_surprise - momentary_eta * momentary_surprise
+        associative_scan(carry.backward, [])
 
         # Generate Hidden States
         hidden_states = XQ_mini_batch
         for idx, (val, gradient) in enumerate(zip(reconstructed, gradients)):
-            attention_mask = torch.tril(hidden_states @ val.transpose(-2, -1))  # [B,nh,K,K]
-            # [B,nh,K,f] @ [B,nh,f,f] + [B,nh,K,f] - ([B,nh,K,K] * [B,nh,K,K]) @ [B,nh,K,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
-            update_term = (eta_matrix * attention_mask + torch.tril(eta_matrix)) @ gradient
+            attention_mask = torch.tril(hidden_states @ val.transpose(-2, -1))
+            update_term = (momentary_eta_matrix * attention_mask + torch.tril(momentary_eta_matrix)) @ gradient
             hidden_states = carry[idx](hidden_states) - update_term
             if idx < carry.depth - 1:
                 hidden_states = carry.activate(hidden_states)
