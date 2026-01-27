@@ -7,7 +7,7 @@ name = "thelethe"
 version = "0.1.0"
 description = "AI models with adaptive memory management and strategic forgetting, inspired by Greek mythology and neuroscience."
 readme = "README.md"
-requires-python = ">=3.9, <3.14"
+requires-python = ">=3.10, <3.14"
 license = {file = "LICENSE"}
 authors = [
     {name = "RetentionLabs", email = "retentionlabs.ai@gmail.com"}
@@ -27,6 +27,17 @@ classifiers = [
 dependencies = [
     "transformers",
 ]
+[project.optional-dependencies]
+dev = [
+    "libcst>=1.8.4",
+    "ruff>=0.13.0"
+]
+torch = [
+    "torch"
+]
+torch-cu128 = [
+    "torch"
+]
 
 [project.urls]
 "Homepage" = "https://github.com/retentionlabs/theRiverLethe"
@@ -37,4 +48,12 @@ dependencies = [
 name = "thelethe"
 
 [tool.uv.sources]
+torch = [
+    { index = "torch-cu128" }
+]
 transformers = { git = "https://github.com/retentionlabs/transformers-ttt", rev = "add-ttt" }
+
+[[tool.uv.index]]
+name = "torch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
