@@ -2,8 +2,8 @@ from .models.origin import *
 from .models.atlas import *
 from .models.cronos import *
 
-from .modelings import PreTrainedTitansModel, AutoTitansModelForCausalLM
-from .configs import PretrainedTitansConfig, AutoTitansConfig
+from .modeling_utils import PreTrainedTitansModel, AutoTitansModelForCausalLM
+from .configuration_utils import PretrainedTitansConfig, AutoTitansConfig
 
 
 AutoTitansConfig.register(OriginConfig.model_type, OriginConfig)
