@@ -94,27 +94,26 @@ class TTTLinearConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`TTTModel`]. It is used to instantiate an TTT
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the TTTLinear 8B.
+    defaults will yield a similar configuration to that of the TTTLinear 1.5B.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
-
     Args:
-        vocab_size (`int`, *optional*, defaults to 32000):
+        vocab_size (`int`, *optional*, defaults to 151936):
             Vocabulary size of the LLaMA model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`LlamaModel`]
-        hidden_size (`int`, *optional*, defaults to 4096):
+        hidden_size (`int`, *optional*, defaults to 2048):
             Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 11008):
+        intermediate_size (`int`, *optional*, defaults to 5504):
             Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 40):
+        num_hidden_layers (`int`, *optional*, defaults to 24):
             Number of hidden layers in the Transformer decoder.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the Transformer decoder.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 2048):
+        max_position_embeddings (`int`, *optional*, defaults to 4096):
             The maximum sequence length that this model might ever be used with. Llama 1 supports up to 2048 tokens,
             Llama 2 up to 4096, CodeLlama up to 16384.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -189,10 +188,10 @@ class TTTLinearConfig(PretrainedConfig):
     ```python
     >>> from transformers import TTTLinearModel, TTTLinearConfig
 
-    >>> # Initializing a TTT ttt_linear-8b style configuration
+    >>> # Initializing a TTT ttt_linear 1.5b style configuration
     >>> configuration = TTTLinearConfig()
 
-    >>> # Initializing a model from the ttt_linear-8b style configuration
+    >>> # Initializing a model from the ttt_linear 1.5b style configuration
     >>> model = TTTLinearModel(configuration)
 
     >>> # Accessing the model configuration
@@ -203,10 +202,10 @@ class TTTLinearConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=40,
+        vocab_size=151936,
+        hidden_size=2048,
+        intermediate_size=5504,
+        num_hidden_layers=24,
         num_attention_heads=32,
         hidden_act="silu",
         max_position_embeddings=4096,
