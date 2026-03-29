@@ -813,6 +813,7 @@ class TTTLinearAdaptation(nn.Module):
             raise ValueError("Mini-batch size cannot be greater than model chunk size configuration")
 
         # Padding
+        cos, sin = position_embeddings
         if mini_batch_size != self.chunk_size:  # Online Adaptation Mode (do not pad)
             if hidden_states.shape[1] != mini_batch_size:
                 raise ValueError("Input token count does not match to the online mini-batch size.")
@@ -820,6 +821,8 @@ class TTTLinearAdaptation(nn.Module):
             pad_length = mini_batch_size - (hidden_states.shape[1] % mini_batch_size)
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_length))
             position_ids = F.pad(position_ids, (0, pad_length))
+            cos = torch.cat([cos, cos[:, -1:].expand(-1, pad_length, -1)], dim=1)
+            sin = torch.cat([sin, sin[:, -1:].expand(-1, pad_length, -1)], dim=1)
 
         B, L = hidden_states.shape[:2]
         num_heads = self.num_heads
@@ -832,7 +835,6 @@ class TTTLinearAdaptation(nn.Module):
         XV = self.v_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
 
         # RoPE
-        cos, sin = position_embeddings
         XQ, XK = apply_rotary_pos_emb(XQ, XK, cos, sin, position_ids)
 
         # [B, num_heads, num_mini_batch, mini_batch_size, head_dim]
