@@ -460,12 +460,12 @@ class TTTAdaptiveLinear(nn.Module):
         if self.weight_fast is None:
             output = x @ self.weight
             if self.use_bias:
-                output += self.bias
+                return output + self.bias_fast
             return output
         else:
             output = x @ self.weight_fast
             if self.use_bias:
-                output += self.bias_fast
+                return output + self.bias_fast
             return output
 
     def detach(self, batch_size: int):
@@ -481,11 +481,11 @@ class TTTAdaptiveLinear(nn.Module):
 
     def step(self):
         if self.weight_grad is not None:
-            self.weight_fast -= self.weight_grad
+            self.weight_fast = self.weight_fast + self.weight_grad
             self.weight_grad = None
         if self.use_bias:
             if self.bias_grad is not None:
-                self.bias_fast -= self.bias_grad
+                self.bias_fast = self.bias_fast + self.bias_grad
                 self.bias_grad = None
 
 
@@ -598,7 +598,8 @@ class TTTLinearMemory(nn.Module):
         backward_grads = [grad_x]
         for fwd, layer in zip(reversed(reconstructed[1:-1]), reversed(self.layers[1:])):
             grad_n = backward_grads[0] @ layer.weight_fast.transpose(-2, -1) * self.activate_derivative(fwd)
-            backward_grads.insert(0, grad_n)
+            backward_grads.append(grad_n)
+        backward_grads = backward_grads[::-1]
 
         mini_batch_size = reconstructed[0].shape[-2]
         # NOTE: The length of 'reconstructed' list is may larger (+1) than the others,
