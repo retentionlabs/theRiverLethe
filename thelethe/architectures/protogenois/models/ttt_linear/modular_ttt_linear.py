@@ -497,16 +497,17 @@ class TTTLinearAdaptationState:
 
     def __init__(
         self, batch_size: int, chunk_size: int, num_heads: int, head_dim: int,
-        memory: Union[list[torch.Tensor, torch.Tensor], nn.ModuleList],
-        norm: TTTMultiheadLayerNorm, lr_gate: TTTDynamicLearningGate
+        memory: Union[nn.ModuleList, list[torch.Tensor, torch.Tensor], list[list[torch.Tensor], list[torch.Tensor]]],
+        norm: TTTMultiheadLayerNorm, lr_gate: TTTDynamicLearningGate, is_vectorized: Optional[bool] = None
     ):
         self.batch_size = batch_size
         self.chunk_size = chunk_size
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-        if isinstance(memory, nn.ModuleList):
+        if isinstance(memory, nn.ModuleList):  # Initial Branching
             weights, biases = [], []
+
             for layer in memory:
                 weight = torch.tile(layer.weight.unsqueeze(0), dims=(batch_size, 1, 1, 1))
                 if layer.use_bias:
@@ -515,10 +516,21 @@ class TTTLinearAdaptationState:
                     bias = torch.tile(torch.tensor(float('nan')), dims=(batch_size, 1, 1, 1))
                 weights.append(weight)
                 biases.append(bias)
-            self.weights = torch.stack(weights, dim=0)
-            self.biases = torch.stack(biases, dim=0)
-        else:
+
+            try:  # try vectorize
+                self.weights = torch.stack(weights, dim=0)
+                self.biases = torch.stack(biases, dim=0)
+                self.is_vectorized = True
+            except RuntimeError:  # failed to vectorize (different weight shapes, ...)
+                self.weights = weights
+                self.biases = biases
+                self.is_vectorized = False
+        else:  # Inherited from previous state
+            if is_vectorized is None:
+                raise ValueError("is_vectorized flag must be provided for state updates.")
+            self.is_vectorized = is_vectorized
             self.weights: torch.Tensor = memory[0]; self.biases: torch.Tensor = memory[1]
+
         self.layers = [self.rasterize(*layer) for layer in zip(self.weights, self.biases)]
         self.depth = len(self.layers)
         self.activate = gelu
@@ -546,10 +558,15 @@ class TTTLinearAdaptationState:
                 raise ValueError(f"Invalid memory state dict key {key} found.")
 
     def step(self, delta: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor, torch.Tensor]):
-        new_state = [self.weights - delta[0], self.biases - delta[1]]
+        if self.is_vectorized:
+            new_state = [self.weights - delta[0], self.biases - delta[1]]
+        else:
+            new_weights = [w - d for w, d in zip(self.weights, delta[0])]
+            new_biases = [b - d for b, d in zip(self.biases, delta[1])]
+            new_state = [new_weights, new_biases]
         return TTTLinearAdaptationState(
             self.batch_size, self.chunk_size, self.num_heads, self.head_dim,
-            new_state, self.norm, self.lr_gate
+            new_state, self.norm, self.lr_gate, self.is_vectorized
         )
 
     def __getitem__(self, idx):
@@ -612,7 +629,11 @@ class TTTLinearAdaptationState:
                 delta_bias = torch.zeros(bias_shape, dtype=delta_weight.dtype, device=delta_weight.device)
             bias_deltas.append(delta_bias)
 
-        return (torch.stack(weight_deltas), torch.stack(bias_deltas)), backward_grads
+        if self.is_vectorized:
+            weight_deltas = torch.stack(weight_deltas)
+            bias_deltas = torch.stack(bias_deltas)
+
+        return (weight_deltas, bias_deltas), backward_grads
 
 
 class TTTLinearAdaptation(nn.Module):
