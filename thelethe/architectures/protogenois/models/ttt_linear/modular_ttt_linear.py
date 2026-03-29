@@ -49,6 +49,7 @@
 # Licensed under Apache License, Version 2.0
 from typing import Any, Dict, Optional, Tuple, Union, Unpack, Mapping
 from collections import defaultdict
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -419,18 +420,20 @@ class TTTDynamicLearningGate(nn.Module):
         return f"{self.__class__.__name__}(heads={self.num_heads}, head_dim={self.head_dim}, lr={self.adapt_base_lr})"
 
     def forward(self, x):
+        current_mini_batch_size = x.shape[-2]
+
         # [B, num_heads, mini_batch_size, 1]
         learning_rate = torch.einsum("bhkc,hcd->bhkd", x, self.theta) + self.theta_bias.view(1, self.num_heads, 1, 1)
         learning_rate = F.sigmoid(learning_rate)
         learning_rate_eta = self.adapt_base_lr * learning_rate / self.head_dim
 
-        # [B, L]
-        token_idx = self.token_idx + self.alpha
+        # [K]
+        token_idx = self.token_idx[:current_mini_batch_size] + self.alpha[:current_mini_batch_size]
         token_idx = torch.clamp_min(token_idx, 0.0)  # token idx should be greater than 0
 
         # NOTE: token_eta is a scale factor that applies to each token in the mini-batch
-        # [B, num_heads, mini_batch_size, 1]
-        token_eta = token_idx.view(1, 1, self.chunk_size, 1)
+        # [1, 1, K, 1], auto-broadcastable to [B, H, K, 1]
+        token_eta = token_idx.view(1, 1, current_mini_batch_size, 1)
 
         return token_eta, learning_rate_eta
 
@@ -583,7 +586,6 @@ class TTTLinearMemory(nn.Module):
         ) / std)
 
         backward_grads = [grad_x]
-        print(f"reconstructed: {len(reconstructed[1:-1])}, layers: {len(self.layers[1:])}")
         for fwd, layer in zip(reversed(reconstructed[1:-1]), reversed(self.layers[1:])):
             grad_n = backward_grads[0] @ layer.weight_fast.transpose(-2, -1) * self.activate_derivative(fwd)
             backward_grads.insert(0, grad_n)
@@ -733,16 +735,14 @@ class TTTLinearAdaptation(nn.Module):
     def step(carry, xs):
         # Projected Inputs
         # [B,nh,K,f], K=mini_batch_size
-        XQ_mini_batch = xs['XQ']
-        XV_mini_batch = xs['XV']
-        XK_mini_batch = xs['XK']
+        XQ_mini_batch, XK_mini_batch, XV_mini_batch = xs.unbind(dim=2)
 
         # Reconstruction Task
         # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f]
         _, reconstructed = carry(XK_mini_batch, output_hidden_states=True)
         reconstructed.insert(0, XK_mini_batch)
         reconstruction_target = XV_mini_batch
-        # [B,h,K,1], [B,h,K,1]
+        # token_eta: [1,1,K,1], lr_eta: [B,H,K,1]
         token_eta, lr_eta = carry.lr_gate(XK_mini_batch)
         eta_scalar = token_eta * lr_eta  # [B,h,K,1] * [B,h,K,1] -> [B,h,K,1] for backward
         eta_matrix = token_eta @ lr_eta.transpose(-2, -1)  # [B,h,K,1] @ [B,h,K,1] -> [B,h,K,K] for hidden state update
@@ -761,7 +761,8 @@ class TTTLinearAdaptation(nn.Module):
 
         # Apply Gradients to fast weight
         carry.step()
-        return carry, hidden_states
+
+        return carry, hidden_states.unsqueeze(2).expand(-1, -1, 3, -1, -1)  # match to xs shape for scan
 
     @auto_docstring
     def forward(
@@ -829,16 +830,16 @@ class TTTLinearAdaptation(nn.Module):
         XK = XK.reshape(B, num_heads, num_mini_batch, mini_batch_size, head_dim)
         XV = XV.reshape(B, num_heads, num_mini_batch, mini_batch_size, head_dim)
 
+        # [B, num_heads, 3, num_mini_batch, mini_batch_size, head_dim]
+        stacked_qkv = torch.stack([XQ, XK, XV], dim=2)
+        xs = stacked_qkv.permute(3, 0, 1, 2, 4, 5)
+
         # input: [B, num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
         # output_hidden_states: [num_mini_batch, B, num_heads, mini_batch_size, head_dim]
         init_params = self.neural_memory.detach(B)
         if cache_params is not None:
             init_params.load_state_dict(cache_params[self.layer_idx])
-        scan_params = dict(
-            combine_fn=self.step,
-            init=init_params,
-            xs=dict(XQ=XQ.permute(2, 0, 1, 3, 4), XK=XK.permute(2, 0, 1, 3, 4), XV=XV.permute(2, 0, 1, 3, 4))
-        )
+        scan_params = dict(combine_fn=self.step, init=init_params, xs=xs)
         try:
             last_params, output_hidden_states = scan(
                 **scan_params,
@@ -846,6 +847,7 @@ class TTTLinearAdaptation(nn.Module):
             )
         except TypeError:  # Using PyTorch official scan
             last_params, output_hidden_states = scan(**scan_params)
+        output_hidden_states = output_hidden_states[:, :, :, 0, :, :]  # [num_mini_batch, B, num_heads, chunk_size, head_dim]
 
         # [B, num_heads, L, C]
         if cache_params is not None:
@@ -931,6 +933,7 @@ class TTTLinearPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
+@dataclass
 class TTTLinearOutput(ModelOutput):
     """
     Class for the TTT model outputs.
@@ -953,6 +956,7 @@ class TTTLinearOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 
+@dataclass
 class TTTLinearCausalLMOutput(ModelOutput):
     """
     Base class for causal language model (or autoregressive) outputs.
