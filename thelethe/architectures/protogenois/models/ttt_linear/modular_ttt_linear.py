@@ -59,7 +59,7 @@ import torch.nn.functional as F
 from ...utils.scan_ops import scan
 from ...configuration_utils import PretrainedConfig
 from ...modeling_rope_utils import rope_config_validation
-from ...modeling_outputs import ModelOutput
+from ...modeling_outputs import ModelOutput, ImageClassifierOutput
 from ...modeling_utils import PreTrainedModel
 from ...modeling_layers import (
     GenericForSequenceClassification,
@@ -74,11 +74,6 @@ from ..llama.modeling_llama import (
 )
 from ..vit.modeling_vit import ViTForImageClassification
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
-from ...utils.import_utils import is_causal_conv1d_available
-if is_causal_conv1d_available():
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-else:
-    causal_conv1d_update, causal_conv1d_fn = None, None
 
 
 logger = logging.get_logger(__name__)
@@ -185,7 +180,7 @@ class TTTLinearConfig(PretrainedConfig):
                     Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
         adapt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner
         chunk_size (`int`, *optional*, defaults to 16): chunk size (mini-batch size) for TTT learner
-        pre_conv (`bool`, *optional*, defaults to `False`): Whether the model use conv before TTT
+        qkv_conv (`bool`, *optional*, defaults to `False`): Whether the model use conv while qkv projection
         conv_kernel (`int`, *optional*, defaults to 4): kernel size of the conv layer
         scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
             gradient checkpoint group size on seq dimension, 0 means no checkpointing.
@@ -229,7 +224,7 @@ class TTTLinearConfig(PretrainedConfig):
         mlp_bias=False,
         adapt_base_lr=1.0,
         chunk_size=16,
-        pre_conv=False,
+        qkv_conv=False,
         conv_kernel=4,
         scan_checkpoint_group_size=0,
         **kwargs,
@@ -254,9 +249,11 @@ class TTTLinearConfig(PretrainedConfig):
         self.adapt_base_lr = adapt_base_lr
         self.chunk_size = chunk_size
 
-        self.pre_conv = pre_conv
+        self.qkv_conv = qkv_conv
         self.conv_kernel = conv_kernel
         self.scan_checkpoint_group_size = scan_checkpoint_group_size
+
+        self.memory_depth = 1  # TTTLinearAdaptation depth
 
         rope_config_validation(self)
         super().__init__(
@@ -266,6 +263,69 @@ class TTTLinearConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+
+class TTTLinearCache:
+    """
+    Fast-Weight cache designed for models that dynamically updates and stores their weights and gradients
+    during a forward pass.
+
+    Unlike standard caches that store key/value states to prevent re-computation, this cache holds the evolving
+    learning state of the model. It enables the model to learn and adapt in-context as it processes a sequence.
+    The cache maintains two primary types of information for each layer's learnable parameters: the current
+    parameter `states` and the `grad` values for the next update.
+
+    Parameters:
+        config (`PretrainedConfig`):
+            The model configuration, used to infer hyperparameters like the number of layers, hidden size,
+            and convolution settings.
+        batch_size (`int`):
+            The number of sequences in the input batch. The cache tensors will be initialized with this
+            batch dimension.
+        layers (`torch.nn.ModuleList`):
+            The list of the model's layers (`Block` modules). This is used to access the initial fast weights
+            for initializing the cache states.
+        device (`torch.device`):
+            The device (e.g., "cuda" or "cpu") on which the cache tensors will be allocated.
+
+    Attributes:
+        state_params_dict (`dict`):
+            The core data store for the fast weights. It's a nested dictionary with the structure:
+            `{"parameter_name_states/grad": {layer_idx: tensor}}`.
+        conv_states_dict (`dict`):
+            A dictionary that holds the states for the convolutional layers, if they are enabled in the config.
+    """
+    layer_list_key = "self_adapt"
+
+    def __init__(self, config: PretrainedConfig, batch_size: int, layers: nn.ModuleList, device: torch.device):
+        self.chunk_size = config.chunk_size
+        self.memory_depth = config.memory_depth
+        self.param_names = [f"layers.{i}.weight" for i in range(self.memory_depth)] + [f"layers.{i}.bias" for i in range(self.memory_depth)]
+
+        self.token_len = 0
+        self.state_dict = defaultdict(dict)
+        self.conv_states_dict = defaultdict(dict)
+        logger.info(f"Creating cache of size: {batch_size}")
+
+        for layer_idx in range(config.num_hidden_layers):
+            for name in self.param_names:
+                _, memory_idx, memory_type = name.split(".")
+                seq_modeling_layer = getattr(layers[layer_idx], self.layer_list_key)
+                weight = getattr(seq_modeling_layer.neural_memory.layers[memory_idx], memory_type)
+
+                tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim()).to(device)
+                self.state_dict[name][layer_idx] = tiled_weight
+
+    def update(self, py_tree, layer_idx):
+        for name in self.param_names:
+            self.state_dict[name][layer_idx].copy_(py_tree[name])
+
+    def __setitem__(self, layer_idx, py_tree):
+        self.update(py_tree, layer_idx)
+
+    def __getitem__(self, layer_idx):
+        return {name: self.state_dict[name][layer_idx] for name in self.state_dict}
+
 
 
 class TTTRMSNorm(LlamaRMSNorm):
@@ -305,55 +365,7 @@ class TTTRotaryEmbedding(LlamaRotaryEmbedding):
         super().__init__(config, device)
 
 
-class TTTCausalConv1d(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-
-        self.norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.conv = nn.Conv1d(
-            config.hidden_size,
-            config.hidden_size,
-            bias=True,
-            kernel_size=config.conv_kernel,
-            groups=config.hidden_size,
-            padding=config.conv_kernel - 1,
-        )
-
-    def forward(self, hidden_states, cache_params=None):
-        seq_len = hidden_states.shape[1]
-        hidden_states = self.norm(hidden_states)
-        # [B, C, L]
-        hidden_states = hidden_states.transpose(1, 2)
-
-        if causal_conv1d_fn is None:
-            if cache_params is not None:
-                conv_state = nn.functional.pad(
-                    hidden_states,
-                    (self.config.conv_kernel - hidden_states.shape[-1], 0),
-                )
-                cache_params.conv_states_dict["pre_conv"][self.layer_idx].copy_(conv_state)
-                hidden_states = self.conv(hidden_states)[..., :seq_len]
-            else:
-                hidden_states = self.conv(hidden_states)[..., :seq_len]
-        else:
-            conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
-            if cache_params is not None:
-                conv_states = nn.functional.pad(
-                    hidden_states,
-                    (self.config.conv_kernel - hidden_states.shape[-1], 0),
-                )
-                cache_params.conv_states_dict["pre_conv"][self.layer_idx].copy_(conv_states)
-            hidden_states = causal_conv1d_fn(hidden_states, conv_weights, self.conv.bias, activation=None)
-
-        # [B, L, C]
-        hidden_states = hidden_states.transpose(1, 2)
-
-        return hidden_states
-
-
-class TTTMultiHeadLayerNorm(nn.Module):
+class TTTMultiheadLayerNorm(nn.Module):
     """Multi-head layer normalization which can calculate norm on multiple heads in a one pass"""
 
     def __init__(self, num_heads: int, dim: Union[int, list[int], torch.Size], eps: float = 1e-6):
@@ -439,7 +451,25 @@ class TTTDynamicLearningGate(nn.Module):
         return token_eta, learning_rate_eta
 
 
-class TTTAdaptiveLinear(nn.Module):
+class TTTMultiheadLinearMixin:
+    def __init__(self):
+        self.use_bias = None
+        self.weight = None
+        self.bias = None
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(self, x):
+        output = x @ self.weight
+        if self.use_bias:
+            return output + self.bias
+        return output
+
+
+class TTTMultiheadLinear(TTTMultiheadLinearMixin, nn.Module):
+    """Expressive Multihead Linear layer"""
+
     def __init__(self, num_heads: int, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
         self.use_bias = bias
@@ -447,125 +477,86 @@ class TTTAdaptiveLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, in_features, out_features)))
-        self.weight_fast = None
-        self.weight_grad = None
         if bias:
             self.bias = nn.Parameter(torch.zeros(num_heads, 1, out_features))
         else:
             self.register_parameter("bias", None)
-        self.bias_fast = None
-        self.bias_grad = None
 
-    def forward(self, x):
-        if self.weight_fast is None:
-            output = x @ self.weight
-            if self.use_bias:
-                return output + self.bias_fast
-            return output
+
+class TTTLinearAdaptationState:
+    """Memory Carry State while Adaptive Learning"""
+
+    @staticmethod
+    def rasterize(weight: torch.Tensor, bias: torch.Tensor):
+        raw = TTTMultiheadLinearMixin()
+        raw.use_bias = not torch.isnan(bias).any()
+        raw.weight = weight
+        if raw.use_bias:
+            raw.bias = bias
+        return raw
+
+    def __init__(
+        self, batch_size: int, chunk_size: int, num_heads: int, head_dim: int,
+        memory: Union[list[torch.Tensor, torch.Tensor], nn.ModuleList],
+        norm: TTTMultiheadLayerNorm, lr_gate: TTTDynamicLearningGate
+    ):
+        self.batch_size = batch_size
+        self.chunk_size = chunk_size
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+        if isinstance(memory, nn.ModuleList):
+            weights, biases = [], []
+            for layer in memory:
+                weight = torch.tile(layer.weight.unsqueeze(0), dims=(batch_size, 1, 1, 1))
+                if layer.use_bias:
+                    bias = torch.tile(layer.bias.unsqueeze(0), dims=(batch_size, 1, 1, 1))
+                else:
+                    bias = torch.tile(torch.tensor(float('nan')), dims=(batch_size, 1, 1, 1))
+                weights.append(weight)
+                biases.append(bias)
+            self.weights = torch.stack(weights, dim=0)
+            self.biases = torch.stack(biases, dim=0)
         else:
-            output = x @ self.weight_fast
-            if self.use_bias:
-                return output + self.bias_fast
-            return output
-
-    def detach(self, batch_size: int):
-        self.weight_fast = torch.tile(self.weight.unsqueeze(0), dims=(batch_size, 1, 1, 1)).to(self.weight.device)
-        if self.use_bias:
-            self.bias_fast = torch.tile(self.bias.unsqueeze(0), dims=(batch_size, 1, 1, 1)).to(self.bias.device)
-        return self
-
-    def attach(self):
-        self.weight_fast = None
-        self.bias_fast = None
-        return self
-
-    def step(self):
-        if self.weight_grad is not None:
-            self.weight_fast = self.weight_fast + self.weight_grad
-            self.weight_grad = None
-        if self.use_bias:
-            if self.bias_grad is not None:
-                self.bias_fast = self.bias_fast + self.bias_grad
-                self.bias_grad = None
-
-
-class TTTLinearMemory(nn.Module):
-    """Memory state holder & controller (Fast weights)"""
-    depth = 1
-
-    @property
-    def struct_detail(self):
-        return [
-            TTTAdaptiveLinear(self.num_heads, self.head_dim, self.head_dim)
-        ]
-
-    def __init__(self, parent_module: 'TTTLinearAdaptation', lr_gate: TTTDynamicLearningGate, norm: TTTMultiHeadLayerNorm):
-        super().__init__()
-        self.chunk_size = parent_module.chunk_size
-        self.num_heads = parent_module.num_heads
-        self.head_dim = parent_module.head_dim
-
-        self.layers = nn.ModuleList(self.struct_detail)
-        if len(self.layers) != self.depth:
-            raise ValueError(f"Expected {self.depth} layers, but got {len(self.layers)}")
+            self.weights: torch.Tensor = memory[0]; self.biases: torch.Tensor = memory[1]
+        self.layers = [self.rasterize(*layer) for layer in zip(self.weights, self.biases)]
+        self.depth = len(self.layers)
         self.activate = gelu
         self.activate_derivative = gelu_derivative
-        self.__dict__['lr_gate'] = lr_gate
-        self.__dict__['norm'] = norm
-        self._detached = False  # whether the memory use fast weights
+        self.norm = norm
+        self.lr_gate = lr_gate
 
     def state_dict(self, *args, **kwargs):
-        if not self._detached:
-            return super().state_dict(*args, **kwargs)
-        states = {f'layers.{i}.weight': self.layers[i].weight_fast for i in range(self.depth)}
-        states.update({f'layers.{i}.bias': self.layers[i].bias_fast for i in range(self.depth)})
+        states = {f'layers.{i}.weight': self.layers[i].weight for i in range(self.depth)}
+        states.update({f'layers.{i}.bias': self.layers[i].bias for i in range(self.depth)})
         return states
 
     def load_state_dict(self, state_dict: Mapping[str, Any], *args, **kwargs):
-        if not self._detached:
-            return super().load_state_dict(state_dict, *args, **kwargs)
         for key, val in state_dict.items():
             try:
                 _, idx, typ = key.split(".")
                 idx = int(idx)
                 if typ == "weight":
-                    self.layers[idx].weight_fast = val
+                    self.layers[idx].weight = val
                 elif typ == "bias":
-                    self.layers[idx].bias_fast = val
+                    self.layers[idx].bias = val
                 else:
                     raise ValueError
             except ValueError:
                 raise ValueError(f"Invalid memory state dict key {key} found.")
 
-    @contextmanager
-    def detached_state(self, batch_size: int):
-        init_params = self.detach(batch_size)
-        try:
-            yield init_params
-        finally:
-            self.attach()
-
-    @property
-    def detached(self):
-        return self._detached
-
-    def detach(self, batch_size: int):
-        if self._detached:
-            return self
-        self._detached = True
-        [l.detach(batch_size) for l in self.layers]
-        return self
-
-    def attach(self):
-        self._detached = False
-        [l.attach() for l in self.layers]
-        return self
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(depth={self.depth})"
+    def step(self, delta: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor, torch.Tensor]):
+        new_state = [self.weights - delta[0], self.biases - delta[1]]
+        return TTTLinearAdaptationState(
+            self.batch_size, self.chunk_size, self.num_heads, self.head_dim,
+            new_state, self.norm, self.lr_gate
+        )
 
     def __getitem__(self, idx):
         return self.layers[idx]
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
 
     def forward(self, x, output_hidden_states=False):
         outs = []
@@ -579,11 +570,10 @@ class TTTLinearMemory(nn.Module):
             return x, outs
         return x
 
-    def backward(self, reconstructed: list[torch.Tensor], reconstruction_target: torch.Tensor, eta):
+    def backward(
+        self, reconstructed: list[torch.Tensor], reconstruction_target: torch.Tensor, eta: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], list[torch.Tensor]]:
         """L2 loss & forward creation of fast weights"""
-        if not self._detached:
-            raise ValueError("Memory is not detached. Please call detach first.")
-
         (y, x_hat, std), gamma = self.norm(reconstructed[-1], return_detailed=True), self.norm.gamma
         D = reconstructed[-1].shape[-1]
 
@@ -597,111 +587,42 @@ class TTTLinearMemory(nn.Module):
 
         backward_grads = [grad_x]
         for fwd, layer in zip(reversed(reconstructed[1:-1]), reversed(self.layers[1:])):
-            grad_n = backward_grads[0] @ layer.weight_fast.transpose(-2, -1) * self.activate_derivative(fwd)
+            grad_n = backward_grads[0] @ layer.weight.transpose(-2, -1) * self.activate_derivative(fwd)
             backward_grads.append(grad_n)
         backward_grads = backward_grads[::-1]
 
         mini_batch_size = reconstructed[0].shape[-2]
+        weight_deltas, bias_deltas = [], []
         # NOTE: The length of 'reconstructed' list is may larger (+1) than the others,
         #       but not sliced to avoid redundant operation (zip will stop iterate automatically)
         for fwd, layer, grad in zip(reconstructed, self.layers, backward_grads):
+            delta_bias = None
             if self.chunk_size == mini_batch_size:  # Use Dual Form
                 # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
                 delta_weight = (eta * fwd).transpose(-1, -2) @ grad
-                if layer.bias_fast is not None: delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
+                if layer.use_bias: delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
             else:  # Use Approx. Primal Form (same logic as dual form, but explicitly branch out for annotation purpose)
                 delta_weight = (eta * fwd).transpose(-1, -2) @ grad
-                if layer.bias_fast is not None: delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
+                if layer.use_bias: delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
 
-            if layer.weight_grad is None:
-                layer.weight_grad = delta_weight
-            else:
-                layer.weight_grad -= delta_weight
+            weight_deltas.append(delta_weight)
+            if delta_bias is None:  # If no bias, create a zero tensor
+                weight_shape = delta_weight.shape
+                bias_shape = weight_shape[:-2] + (1, weight_shape[-1])  # [B,nh,1,output_dim]
+                delta_bias = torch.zeros(bias_shape, dtype=delta_weight.dtype, device=delta_weight.device)
+            bias_deltas.append(delta_bias)
 
-            if layer.bias_fast is not None:
-                if layer.bias_grad is None:
-                    layer.bias_grad = delta_bias
-                else:
-                    layer.bias_grad -= delta_bias
-
-        return backward_grads
-
-    def step(self):
-        for layer in self.layers:
-            layer.step()
-
-
-class TTTLinearCache:
-    """
-    Fast-Weight cache designed for models that dynamically updates and stores their weights and gradients
-    during a forward pass.
-
-    Unlike standard caches that store key/value states to prevent re-computation, this cache holds the evolving
-    learning state of the model. It enables the model to learn and adapt in-context as it processes a sequence.
-    The cache maintains two primary types of information for each layer's learnable parameters: the current
-    parameter `states` and the `grad` values for the next update.
-
-    Parameters:
-        config (`PretrainedConfig`):
-            The model configuration, used to infer hyperparameters like the number of layers, hidden size,
-            and convolution settings.
-        batch_size (`int`):
-            The number of sequences in the input batch. The cache tensors will be initialized with this
-            batch dimension.
-        layers (`torch.nn.ModuleList`):
-            The list of the model's layers (`Block` modules). This is used to access the initial fast weights
-            for initializing the cache states.
-        device (`torch.device`):
-            The device (e.g., "cuda" or "cpu") on which the cache tensors will be allocated.
-
-    Attributes:
-        state_params_dict (`dict`):
-            The core data store for the fast weights. It's a nested dictionary with the structure:
-            `{"parameter_name_states/grad": {layer_idx: tensor}}`.
-        conv_states_dict (`dict`):
-            A dictionary that holds the states for the convolutional layers, if they are enabled in the config.
-    """
-    memory_class = TTTLinearMemory
-    layer_list_key = "self_adapt"
-
-    def __init__(self, config: PretrainedConfig, batch_size: int, layers: nn.ModuleList, device: torch.device):
-        self.chunk_size = config.chunk_size
-        self.memory_depth = self.memory_class.depth
-        self.param_names = [f"layers.{i}.weight" for i in range(self.memory_depth)] + [f"layers.{i}.bias" for i in range(self.memory_depth)]
-
-        self.token_len = 0
-        self.state_dict = defaultdict(dict)
-        self.conv_states_dict = defaultdict(dict)
-        logger.info(f"Creating cache of size: {batch_size}")
-
-        for layer_idx in range(config.num_hidden_layers):
-            for name in self.param_names:
-                _, memory_idx, memory_type = name.split(".")
-                seq_modeling_layer = getattr(layers[layer_idx], self.layer_list_key)
-                weight = getattr(seq_modeling_layer.neural_memory.layers[memory_idx], memory_type)
-
-                tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim()).to(device)
-                self.state_dict[name][layer_idx] = tiled_weight
-
-            if config.pre_conv:
-                self.conv_states_dict["pre_conv"][layer_idx] = torch.zeros(
-                    batch_size,
-                    config.hidden_size,
-                    config.conv_kernel,
-                    device=device,
-                )
-
-    def update(self, py_tree, layer_idx):
-        for name in self.param_names:
-            self.state_dict[name][layer_idx].copy_(py_tree[name])
-
-    def __getitem__(self, layer_idx):
-        return {name: self.state_dict[name][layer_idx] for name in self.state_dict}
+        return (torch.stack(weight_deltas), torch.stack(bias_deltas)), backward_grads
 
 
 class TTTLinearAdaptation(nn.Module):
-    memory_class = TTTLinearMemory
     _private_modules = ["neural_memory"]
+
+    @staticmethod
+    def struct_details(num_heads: int, head_dim: int):
+        return [
+            dict(num_heads=num_heads, in_features=head_dim, out_features=head_dim)
+        ]
 
     def __init__(self, config: TTTLinearConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -719,18 +640,35 @@ class TTTLinearAdaptation(nn.Module):
         self.head_dim = self.width // self.num_heads
         self.chunk_size = config.chunk_size
         self.conv_kernel = config.conv_kernel
+        self.qkv_conv = config.qkv_conv
 
         self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
 
+        if config.qkv_conv:  # depthwise conv
+            self.conv_q = nn.Conv1d(
+                self.head_dim, self.head_dim, groups=self.head_dim, bias=False,
+                kernel_size=config.conv_kernel, padding=config.conv_kernel // 2  # same padding for non-causal conv
+            )
+            self.conv_k = nn.Conv1d(
+                self.head_dim, self.head_dim, groups=self.head_dim, bias=False,
+                kernel_size=config.conv_kernel, padding=config.conv_kernel // 2
+            )
+            self.conv_v = nn.Conv1d(
+                self.head_dim, self.head_dim, groups=self.head_dim, bias=False,
+                kernel_size=config.conv_kernel, padding=config.conv_kernel // 2
+            )
+
         self.lr_gate = TTTDynamicLearningGate(
             self.num_heads, self.head_dim,
             self.chunk_size, self.config.adapt_base_lr
         )
-        self.shared_norm = TTTMultiHeadLayerNorm(self.num_heads, self.head_dim, self.config.mini_batch_eps)
-        self.neural_memory = self.memory_class(self, self.lr_gate, self.shared_norm)
+        self.shared_norm = TTTMultiheadLayerNorm(self.num_heads, self.head_dim, self.config.mini_batch_eps)
+        self.neural_memory = nn.ModuleList([
+            TTTMultiheadLinear(**struct) for struct in self.struct_details(self.num_heads, self.head_dim)
+        ])
 
         self.post_norm = nn.LayerNorm(self.width, eps=1e-6)
 
@@ -745,37 +683,38 @@ class TTTLinearAdaptation(nn.Module):
         return "\n".join(lines)
 
     @staticmethod
-    def step(carry, xs):
+    def adapt_step(carry: TTTLinearAdaptationState, xs: torch.Tensor):
         # Projected Inputs
         # [B,nh,K,f], K=mini_batch_size
-        XQ_mini_batch, XK_mini_batch, XV_mini_batch = xs.unbind(dim=2)
+        xq_mini_batch, xk_mini_batch, xv_mini_batch = xs.unbind(dim=2)
 
         # Reconstruction Task
         # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f]
-        _, reconstructed = carry(XK_mini_batch, output_hidden_states=True)
-        reconstructed.insert(0, XK_mini_batch)
-        reconstruction_target = XV_mini_batch
+        _, reconstructed = carry(xk_mini_batch, output_hidden_states=True)
+        reconstructed = [xk_mini_batch] + reconstructed
+        reconstruction_target = xv_mini_batch
         # token_eta: [1,1,K,1], lr_eta: [B,H,K,1]
-        token_eta, lr_eta = carry.lr_gate(XK_mini_batch)
+        token_eta, lr_eta = carry.lr_gate(xk_mini_batch)
         eta_scalar = token_eta * lr_eta  # [B,h,K,1] * [B,h,K,1] -> [B,h,K,1] for backward
         eta_matrix = token_eta @ lr_eta.transpose(-2, -1)  # [B,h,K,1] @ [B,h,K,1] -> [B,h,K,K] for hidden state update
-        gradients = carry.backward(reconstructed, reconstruction_target, eta=eta_scalar)
+        deltas, gradients = carry.backward(reconstructed, reconstruction_target, eta=eta_scalar)
 
         # Generate Hidden States
-        hidden_states = XQ_mini_batch
+        depth = len(carry.layers)
+        hidden_states = xq_mini_batch
         for idx, (val, gradient) in enumerate(zip(reconstructed, gradients)):
             attention_mask = torch.tril(hidden_states @ val.transpose(-2, -1))  # [B,nh,K,K]
             # [B,nh,K,f] @ [B,nh,f,f] + [B,nh,K,f] - ([B,nh,K,K] * [B,nh,K,K]) @ [B,nh,K,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
             update_term = (eta_matrix * attention_mask + torch.tril(eta_matrix)) @ gradient
             hidden_states = carry[idx](hidden_states) - update_term
-            if idx < carry.depth - 1:
+            if idx < depth - 1:
                 hidden_states = carry.activate(hidden_states)
-        hidden_states = XQ_mini_batch + carry.norm(hidden_states)  # residual connection
+        hidden_states = xq_mini_batch + carry.norm(hidden_states)  # residual connection
 
-        # Apply Gradients to fast weight
-        carry.step()
+        # Update Carry
+        next_carry = carry.step(deltas)
 
-        return carry, hidden_states.unsqueeze(2).expand(-1, -1, 3, -1, -1)  # match to xs shape for scan
+        return next_carry, hidden_states.unsqueeze(2).expand(-1, -1, 3, -1, -1)  # match to xs shape for scan
 
     @auto_docstring
     def forward(
@@ -825,6 +764,12 @@ class TTTLinearAdaptation(nn.Module):
         XK = self.k_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
         XV = self.v_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
 
+        # QKV Post Convolution
+        if self.use_conv:
+            XQ = self.conv_q(XQ)  # local pattern
+            XK = self.conv_k(XK)  # key representation
+            XV = self.conv_v(XV)  # value representation
+
         # RoPE
         cos, sin = position_embeddings
         XQ, XK = apply_rotary_pos_emb(XQ, XK, cos, sin, position_ids)
@@ -838,25 +783,25 @@ class TTTLinearAdaptation(nn.Module):
         stacked_qkv = torch.stack([XQ, XK, XV], dim=2)
         xs = stacked_qkv.permute(3, 0, 1, 2, 4, 5)
 
-        with self.neural_memory.detached_state(B) as init_params:
-            if cache_params is not None:
-                init_params.load_state_dict(cache_params[self.layer_idx])
+        init_params = self.branch(batch_size=B)
+        if cache_params is not None:
+            init_params.load_state_dict(cache_params[self.layer_idx])
 
-            # input: [B, num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
-            # output_hidden_states: [num_mini_batch, B, num_heads, mini_batch_size, head_dim]
-            scan_params = dict(combine_fn=self.step, init=init_params, xs=xs)
-            try:
-                last_params, output_hidden_states = scan(
-                    **scan_params,
-                    checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0
-                )
-            except TypeError:  # Using PyTorch official scan
-                last_params, output_hidden_states = scan(**scan_params)
-            output_hidden_states = output_hidden_states[:, :, :, 0, :, :]  # [num_mini_batch, B, num_heads, chunk_size, head_dim]
+        # input: [B, num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
+        # output_hidden_states: [num_mini_batch, B, num_heads, mini_batch_size, head_dim]
+        scan_params = dict(combine_fn=self.adapt_step, init=init_params, xs=xs)
+        try:
+            last_params, output_hidden_states = scan(
+                **scan_params,
+                checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0
+            )
+        except TypeError:  # Using PyTorch official scan (Does not support checkpoint_group / Future use)
+            last_params, output_hidden_states = scan(**scan_params)
+        output_hidden_states = output_hidden_states[:, :, :, 0, :, :]  # [num_mini_batch, B, num_heads, chunk_size, head_dim]
 
-            # [B, num_heads, L, C]
-            if cache_params is not None:
-                cache_params.update(last_params.state_dict, self.layer_idx)
+        # [B, num_heads, L, C]
+        if cache_params is not None:
+            cache_params[self.layer_idx] = last_params.state_dict()
 
         # [num_mini_batch, B, num_heads, mini_batch_size, head_dim] -> [B, num_mini_batch, mini_batch_size, num_heads, head_dim]
         output_hidden_states = output_hidden_states.permute(1, 0, 3, 2, 4)
@@ -868,18 +813,21 @@ class TTTLinearAdaptation(nn.Module):
 
         return output_hidden_states
 
+    def branch(self, batch_size: int):
+        """Branch the neural memory for Test-time learning"""
+        return TTTLinearAdaptationState(
+            batch_size, self.chunk_size, self.num_heads, self.head_dim,
+            self.neural_memory.layers, self.neural_memory.norm, self.neural_memory.lr_gate
+        )
+
 
 class TTTLinearLayer(nn.Module):
     def __init__(self, config: TTTLinearConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.pre_conv = config.pre_conv
 
         self.self_adapt = TTTLinearAdaptation(config=config, layer_idx=layer_idx)
-
         self.mlp = TTTSwiGluMLP(config)
-        if self.pre_conv:
-            self.conv = TTTCausalConv1d(config, layer_idx)
 
         self.seq_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -894,9 +842,6 @@ class TTTLinearLayer(nn.Module):
         mini_batch_size: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs]
     ) -> tuple[torch.Tensor]:
-        if self.pre_conv:
-            hidden_states = hidden_states + self.conv(hidden_states, cache_params=cache_params)
-
         residual = hidden_states
         hidden_states = self.seq_norm(hidden_states)
 
@@ -1348,10 +1293,26 @@ class TTTLinearForImageClassification(ViTForImageClassification):
         super().__init__(config)
         self.vit = TTTLinearModel(config)  # TODO: Add patch config and patch embedding
 
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        interpolate_pos_encoding: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[tuple, ImageClassifierOutput]:
+        return super().forward(
+            pixel_values, head_mask, labels,
+            output_attentions, output_hidden_states,
+            interpolate_pos_encoding, return_dict
+        )
+
 
 __all__ = [
     "TTTLinearConfig",
-    "TTTLinearMemory",
+    "TTTLinearCache",
     "TTTLinearAdaptation",
     "TTTLinearLayer",
     "TTTLinearPreTrainedModel",
