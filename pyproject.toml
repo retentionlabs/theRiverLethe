@@ -4,10 +4,10 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "thelethe"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI models with adaptive memory management and strategic forgetting, inspired by Greek mythology and neuroscience."
 readme = "README.md"
-requires-python = ">=3.10, <3.14"
+requires-python = ">=3.11"
 license = {file = "LICENSE"}
 authors = [
     {name = "RetentionLabs", email = "retentionlabs.ai@gmail.com"}
@@ -25,18 +25,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "transformers",
+    "transformers>=5.4.0",
 ]
 [project.optional-dependencies]
 dev = [
-    "libcst>=1.8.4",
-    "ruff>=0.13.0"
+    "libcst>=1.8.6",
+    "ruff>=0.15.8"
 ]
 torch = [
-    "torch"
-]
-torch-cu128 = [
-    "torch"
+    "torch ; platform_system == 'Windows'",
+    "torch>=2.8.0",
 ]
 
 [project.urls]
@@ -49,11 +47,10 @@ name = "thelethe"
 
 [tool.uv.sources]
 torch = [
-    { index = "torch-cu128" }
+    { index = "pytorch-windows", marker = "platform_system == 'Windows'" },
 ]
-transformers = { git = "https://github.com/retentionlabs/transformers-ttt", rev = "add-ttt" }
 
 [[tool.uv.index]]
-name = "torch-cu128"
+name = "pytorch-windows"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
