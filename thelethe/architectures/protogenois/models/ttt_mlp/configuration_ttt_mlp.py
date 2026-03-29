@@ -177,7 +177,7 @@ class TTTMLPConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mini_batch_eps=1e-6,
-        use_cache=False,
+        use_cache=True,
         pad_token_id=None,
         bos_token_id=1,
         eos_token_id=2,
