@@ -1,0 +1,51 @@
+name: 250926_pretrain_smollm-360m_rec2_middle_sequence_random_lr3e-3
+wandb: true
+wandb_mode: offline
+wandb_entity: efficient-ai-projects
+wandb_project: mixture-of-recursions
+wandb_run_name: null
+output_dir: null
+tensorboard: false
+tensorboard_dir: null
+train_cfg_fpath: conf/pretrain
+model_name_or_path: pretrain/250926_pretrain_smollm-360m_rec2_middle_sequence_random_lr3e-3
+max_length: null
+add_bos_token: null
+tokenizer: null
+model: null
+attn_implementation: null
+model_config: null
+precision: null
+recursive: null
+eval_fewshot:
+  eval_multiple_checkpoints: false
+  tasks: lambada_openai,hellaswag,piqa,winogrande,arc_easy,arc_challenge,openbookqa,mmlu,mmlu_continuation
+  model: recursive_lm
+  model_args: null
+  model_name_or_path: null
+  batch_size: 32
+  device: cuda:0
+  log_samples: false
+  num_fewshot: null
+  max_batch_size: null
+  output_path: null
+  limit: null
+  use_cache: null
+  cache_requests: false
+  check_integrity: false
+  write_out: false
+  show_config: true
+  verbosity: INFO
+  gen_kwargs: null
+  fewshot_as_multiturn: false
+  apply_chat_template: false
+  system_instruction: null
+  trust_remote_code: true
+  predict_only: false
+  seed:
+  - 0
+  - 1234
+  - 1234
+  - 1234
+  hf_hub_log_args: ''
+  include_path: null

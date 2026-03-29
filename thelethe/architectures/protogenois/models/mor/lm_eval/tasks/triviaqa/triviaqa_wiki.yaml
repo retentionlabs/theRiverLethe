@@ -1,0 +1,58 @@
+task: triviaqa_wiki
+dataset_path: trivia_qa
+dataset_name: rc.wikipedia.nocontext
+output_type: generate_until
+training_split: train
+validation_split: validation
+description: "Answer these questions:\n\n"
+doc_to_text: "Q: {{question}}?\nA:"
+doc_to_target: "{{answer.aliases}}"
+should_decontaminate: true
+doc_to_decontamination_query: question
+generation_kwargs:
+  until:
+    - "\n"
+  do_sample: false
+  temperature: 0.0
+  # coppied from llama3
+  max_gen_toks: 24
+filter_list:
+  - name: remove_whitespace
+    filter:
+      - function: remove_whitespace
+      - function: take_first
+target_delimiter: " "
+fewshot_delimiter: "\n"
+fewshot_config:
+  sampler: first_n
+  samples:
+    - question: Who was President when the first Peanuts cartoon was published?
+      answer:
+        aliases:
+          - Harry Truman
+    - question: Which American-born Sinclair won the Nobel Prize for Literature in 1930?
+      answer:
+        aliases:
+          - Sinclair Lewis
+    - question: Where in England was Dame Judi Dench born?
+      answer:
+        aliases:
+          - York
+    - question: William Christensen of Madison, New Jersey, has claimed to have the world's biggest collection of what?
+      answer:
+        aliases:
+          - Beer Cans
+    - question: In which decade did Billboard magazine first publish and American hit chart?
+      answer:
+        aliases:
+          - 30s
+test_split: validation
+num_fewshot: 5
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+metadata:
+  version: 3.0

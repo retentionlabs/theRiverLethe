@@ -1,0 +1,107 @@
+name: 250926_pretrain_smollm-360m_rec2_middle_sequence_random_lr3e-3
+wandb: true
+wandb_mode: online
+wandb_entity: efficient-ai-projects
+wandb_project: mixture-of-recursions
+wandb_run_name: null
+output_dir: null
+wandb_run_id: 7J8Y4JiQ
+tensorboard: false
+tensorboard_dir: null
+resume_from_checkpoint: false
+dataset: fineweb_edu
+weights: null
+total_batch_size: 1024
+per_device_train_batch_size: 16
+gradient_accumulation_steps: null
+batch_size_rampup_steps: null
+max_length: 2048
+add_bos_token: false
+global_shuffling: false
+local_shuffling: false
+tokenizer: smollm
+model: smollm
+model_name_or_path: HuggingFaceTB/SmolLM-360M
+model_config: null
+attn_implementation: flash_attention_2
+use_pretrained_weights: false
+recursive:
+  enable: true
+  base_depth: null
+  num_recursion: 2
+  sharing: middle_sequence
+  ln_share: true
+  initialization: random
+kv_sharing:
+  enable: false
+  base_depth: null
+  num_recursion: null
+  sharing: null
+relaxation:
+  enable: false
+  skip_first_loop: false
+  method: lora
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.1
+    target_modules:
+    - q_proj
+    - v_proj
+    rank_pattern: null
+    alpha_pattern: 2.0
+    svd_init: false
+  prompt:
+    len: 16
+mor:
+  enable: false
+  type: expert
+  capacity: null
+  rand_router: false
+  router_type: mlp
+  z_loss: false
+  z_coeff: 0.001
+  temp: 1.0
+  expert:
+    cap_warmup_step: 0
+    router_func: sigmoid
+    alpha: 0.1
+    sampling: aux_loss
+    include_first: true
+    coeff: 0.001
+    gating: weighted
+  token:
+    router_func: sigmoid
+    alpha: 0.1
+    balancing: loss
+    coeff: 0.001
+    u: 0.001
+    gating: weighted
+lr_scheduler_type: warmup_stable_decay
+lr_scheduler_kwargs:
+  num_decay_steps: 1888
+  decay_type: linear  # Note num_warmup_steps must be constant integer (not %) 
+learning_rate: 0.003
+adam_beta1: 0.9
+adam_beta2: 0.95
+weight_decay: 0.1
+precision: bf16
+max_grad_norm: 1.0
+num_train_steps: 9438
+stop_steps: 9438
+num_warmup_steps: 57
+save_interval: 0.1
+save_steps: null
+fixed_save_steps: null
+save_total_limit: null
+logging_steps: 100
+dataloader_num_workers: 0
+gradient_checkpointing: false
+deepspeed: ds_configs/stage2.config
+evaluation:
+  enable: false
+  eval_steps: 5
+  batch_size: 16
+  tasks: lambada_openai,hellaswag,piqa,winogrande,arc_easy,arc_challenge,openbookqa,mmlu,mmlu_continuation,truthfulqa
+  device: null
+  num_fewshot: null
