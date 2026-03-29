@@ -1019,7 +1019,7 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
             rope_start_pos = cache_params.token_len
 
         if position_ids is None:
-            position_ids = torch.arange(rope_start_pos, inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
+            position_ids = torch.arange(rope_start_pos, rope_start_pos + inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
 
         hidden_states = inputs_embeds
 

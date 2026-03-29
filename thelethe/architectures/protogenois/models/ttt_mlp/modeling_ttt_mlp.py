@@ -973,7 +973,7 @@ class TTTMLPModel(TTTMLPPreTrainedModel):
 
         if position_ids is None:
             position_ids = torch.arange(
-                rope_start_pos, inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device
+                rope_start_pos, rope_start_pos + inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device
             ).unsqueeze(0)
 
         hidden_states = inputs_embeds
