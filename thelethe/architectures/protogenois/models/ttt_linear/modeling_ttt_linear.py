@@ -122,8 +122,9 @@ class TTTLinearCache:
         for layer_idx in range(config.num_hidden_layers):
             for name in self.param_names:
                 _, memory_idx, memory_type = name.split(".")
+                memory_idx = int(memory_idx)
                 seq_modeling_layer = getattr(layers[layer_idx], self.layer_list_key)
-                weight = getattr(seq_modeling_layer.neural_memory.layers[memory_idx], memory_type)
+                weight = getattr(seq_modeling_layer.neural_memory[memory_idx], memory_type)
 
                 tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim()).to(device)
                 self.state_dict[name][layer_idx] = tiled_weight
@@ -506,30 +507,44 @@ class TTTLinearAdaptationState:
 
         mini_batch_size = reconstructed[0].shape[-2]
         weight_deltas, bias_deltas = [], []
-        # NOTE: The length of 'reconstructed' list is may larger (+1) than the others,
-        #       but not sliced to avoid redundant operation (zip will stop iterate automatically)
-        for fwd, layer, grad in zip(reconstructed, self.layers, backward_grads):
-            delta_bias = None
-            if self.chunk_size == mini_batch_size:  # Use Dual Form
-                # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                delta_weight = (eta * fwd).transpose(-1, -2) @ grad
-                if layer.use_bias:
-                    delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
-            else:  # Use Approx. Primal Form (same logic as dual form, but explicitly branch out for annotation purpose)
-                delta_weight = (eta * fwd).transpose(-1, -2) @ grad
-                if layer.use_bias:
-                    delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
-
-            weight_deltas.append(delta_weight)
-            if delta_bias is None:  # If no bias, create a zero tensor
-                weight_shape = delta_weight.shape
-                bias_shape = weight_shape[:-2] + (1, weight_shape[-1])  # [B,nh,1,output_dim]
-                delta_bias = torch.zeros(bias_shape, dtype=delta_weight.dtype, device=delta_weight.device)
-            bias_deltas.append(delta_bias)
-
         if self.is_vectorized:
-            weight_deltas = torch.stack(weight_deltas)
-            bias_deltas = torch.stack(bias_deltas)
+            fwd_stack = torch.stack(reconstructed[:-1])  # [depth, B, nh, K, f]
+            grad_stack = torch.stack(backward_grads)  # [depth, B, nh, K, f]
+
+            weight_deltas = torch.matmul((eta * fwd_stack).transpose(-2, -1), grad_stack)
+            if all(layer.use_bias for layer in self.layers):
+                bias_deltas = torch.sum(eta * grad_stack, dim=-2, keepdim=True)  # [depth, B, nh, 1, f]
+            else:
+                for i, (layer, grad) in enumerate(zip(self.layers, backward_grads)):
+                    if layer.use_bias:
+                        delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
+                    else:
+                        weight_shape = weight_deltas[i].shape
+                        bias_shape = weight_shape[:-2] + (1, weight_shape[-1])
+                        delta_bias = torch.zeros(bias_shape, dtype=weight_deltas.dtype, device=weight_deltas.device)
+                    bias_deltas.append(delta_bias)
+                bias_deltas = torch.stack(bias_deltas)
+        else:
+            # NOTE: The length of 'reconstructed' list is may larger (+1) than the others,
+            #       but not sliced to avoid redundant operation (zip will stop iterate automatically)
+            for fwd, layer, grad in zip(reconstructed, self.layers, backward_grads):
+                delta_bias = None
+                if self.chunk_size == mini_batch_size:  # Use Dual Form
+                    # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                    delta_weight = (eta * fwd).transpose(-1, -2) @ grad
+                    if layer.use_bias:
+                        delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
+                else:  # Use Approx. Primal Form (same logic as dual form, but explicitly branch out for annotation purpose)
+                    delta_weight = (eta * fwd).transpose(-1, -2) @ grad
+                    if layer.use_bias:
+                        delta_bias = torch.sum(eta * grad, dim=-2, keepdim=True)
+
+                weight_deltas.append(delta_weight)
+                if delta_bias is None:  # If no bias, create a zero tensor
+                    weight_shape = delta_weight.shape
+                    bias_shape = weight_shape[:-2] + (1, weight_shape[-1])  # [B,nh,1,output_dim]
+                    delta_bias = torch.zeros(bias_shape, dtype=delta_weight.dtype, device=delta_weight.device)
+                bias_deltas.append(delta_bias)
 
         return (weight_deltas, bias_deltas), backward_grads
 
