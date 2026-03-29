@@ -812,18 +812,6 @@ class TTTLinearAdaptation(nn.Module):
         elif mini_batch_size > self.chunk_size:
             raise ValueError("Mini-batch size cannot be greater than model chunk size configuration")
 
-        # Padding
-        cos, sin = position_embeddings
-        if mini_batch_size != self.chunk_size:  # Online Adaptation Mode (do not pad)
-            if hidden_states.shape[1] != mini_batch_size:
-                raise ValueError("Input token count does not match to the online mini-batch size.")
-        elif hidden_states.shape[1] % mini_batch_size > 0:  # Padding for batch process
-            pad_length = mini_batch_size - (hidden_states.shape[1] % mini_batch_size)
-            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_length))
-            position_ids = F.pad(position_ids, (0, pad_length))
-            cos = torch.cat([cos, cos[:, -1:].expand(-1, pad_length, -1)], dim=1)
-            sin = torch.cat([sin, sin[:, -1:].expand(-1, pad_length, -1)], dim=1)
-
         B, L = hidden_states.shape[:2]
         num_heads = self.num_heads
         head_dim = self.head_dim
@@ -835,6 +823,7 @@ class TTTLinearAdaptation(nn.Module):
         XV = self.v_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
 
         # RoPE
+        cos, sin = position_embeddings
         XQ, XK = apply_rotary_pos_emb(XQ, XK, cos, sin, position_ids)
 
         # [B, num_heads, num_mini_batch, mini_batch_size, head_dim]
@@ -1004,6 +993,7 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.chunk_size = config.chunk_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([TTTLinearLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
@@ -1075,12 +1065,17 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
         if "attention_mask" in kwargs:
             logging.warning_once(f"{self.__class__} does not use attention mask, but it is provided. It will be ignored.")
             kwargs.pop("attention_mask")  # TTTLinear does not use attention mask
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if mini_batch_size is None:  # Batch Learning Process
+            mini_batch_size = self.chunk_size
+        elif mini_batch_size > self.chunk_size:
+            raise ValueError("Mini-batch size cannot be greater than model chunk size configuration")
 
         rope_start_pos = 0
         if cache_params is None and use_cache:
@@ -1091,6 +1086,16 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
             position_ids = torch.arange(rope_start_pos, inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
 
         hidden_states = inputs_embeds
+
+        pad_length = 0
+        if mini_batch_size != self.chunk_size:  # Online Adaptation Mode (do not pad)
+            if hidden_states.shape[1] != mini_batch_size:
+                raise ValueError("Input token count does not match to the online mini-batch size.")
+        elif hidden_states.shape[1] % mini_batch_size > 0:  # Padding for batch process
+            pad_length = mini_batch_size - (hidden_states.shape[1] % mini_batch_size)
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_length))
+            position_ids = F.pad(position_ids, (0, pad_length))
+
         position_embeddings = self.rotary_emb(input_ids, position_ids)
 
         all_hidden_states = () if output_hidden_states else None
@@ -1117,13 +1122,14 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
                 )
 
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+                if pad_length > 0:
+                    all_hidden_states = all_hidden_states + (hidden_states[:, : -pad_length])
+                else:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
 
+        if pad_length > 0:
+            hidden_states = hidden_states[:, : -pad_length]
         hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
 
         if use_cache:
             cache_params.token_len += hidden_states.shape[1]
