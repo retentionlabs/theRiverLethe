@@ -48,6 +48,7 @@
 #
 # Licensed under Apache License, Version 2.0
 from typing import Any, Dict, Optional, Tuple, Union, Unpack, Mapping
+from contextlib import contextmanager
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -438,63 +439,64 @@ class TTTDynamicLearningGate(nn.Module):
         return token_eta, learning_rate_eta
 
 
+class TTTAdaptiveLinear(nn.Module):
+    def __init__(self, num_heads: int, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.use_bias = bias
+        self.num_heads = num_heads
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, in_features, out_features)))
+        self.weight_fast = None
+        self.weight_grad = None
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(num_heads, 1, out_features))
+        else:
+            self.register_parameter("bias", None)
+        self.bias_fast = None
+        self.bias_grad = None
+
+    def forward(self, x):
+        if self.weight_fast is None:
+            output = x @ self.weight
+            if self.use_bias:
+                output += self.bias
+            return output
+        else:
+            output = x @ self.weight_fast.to(x.device)
+            if self.use_bias:
+                output += self.bias_fast.to(x.device)
+            return output
+
+    def detach(self, batch_size: int):
+        self.weight_fast = torch.tile(self.weight.unsqueeze(0), dims=(batch_size, 1, 1, 1)).to(self.weight.device)
+        if self.use_bias:
+            self.bias_fast = torch.tile(self.bias.unsqueeze(0), dims=(batch_size, 1, 1, 1)).to(self.bias.device)
+        return self
+
+    def attach(self):
+        self.weight_fast = None
+        self.bias_fast = None
+        return self
+
+    def step(self):
+        if self.weight_grad is not None:
+            self.weight_fast -= self.weight_grad
+            self.weight_grad = None
+        if self.use_bias:
+            if self.bias_grad is not None:
+                self.bias_fast -= self.bias_grad
+                self.bias_grad = None
+
+
 class TTTLinearMemory(nn.Module):
     """Memory state holder & controller (Fast weights)"""
     depth = 1
 
-    class AdaptiveLinear(nn.Module):
-        def __init__(self, num_heads: int, in_features: int, out_features: int, bias: bool = True):
-            super().__init__()
-            self.use_bias = bias
-            self.num_heads = num_heads
-            self.in_features = in_features
-            self.out_features = out_features
-            self.weight = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, in_features, out_features)))
-            self.weight_fast = None
-            self.weight_grad = None
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(num_heads, 1, out_features))
-            else:
-                self.register_parameter("bias", None)
-            self.bias_fast = None
-            self.bias_grad = None
-
-        def forward(self, x):
-            if self.weight_fast is None:
-                output = x @ self.weight
-                if self.use_bias:
-                    output += self.bias
-                return output
-            else:
-                output = x @ self.weight_fast.to(x.device)
-                if self.use_bias:
-                    output += self.bias_fast.to(x.device)
-                return output
-
-        def detach(self, batch_size: int):
-            self.weight_fast = torch.tile(self.weight.unsqueeze(0), dims=(batch_size, 1, 1, 1)).to(self.weight.device)
-            if self.use_bias:
-                self.bias_fast = torch.tile(self.bias.unsqueeze(0), dims=(batch_size, 1, 1, 1)).to(self.bias.device)
-            return self
-
-        def attach(self):
-            self.weight_fast = None
-            self.bias_fast = None
-            return self
-
-        def step(self):
-            if self.weight_grad is not None:
-                self.weight_fast -= self.weight_grad
-                self.weight_grad = None
-            if self.use_bias:
-                if self.bias_grad is not None:
-                    self.bias_fast -= self.bias_grad
-                    self.bias_grad = None
-
     @property
     def struct_detail(self):
         return [
-            self.AdaptiveLinear(self.num_heads, self.head_dim, self.head_dim)
+            TTTAdaptiveLinear(self.num_heads, self.head_dim, self.head_dim)
         ]
 
     def __init__(self, parent_module: 'TTTLinearAdaptation', lr_gate: TTTDynamicLearningGate, norm: TTTMultiHeadLayerNorm):
@@ -534,6 +536,14 @@ class TTTLinearMemory(nn.Module):
                     raise ValueError
             except ValueError:
                 raise ValueError(f"Invalid memory state dict key {key} found.")
+
+    @contextmanager
+    def detached_state(self, batch_size: int):
+        init_params = self.detach(batch_size)
+        try:
+            yield init_params
+        finally:
+            self.attach()
 
     @property
     def detached(self):
@@ -834,24 +844,25 @@ class TTTLinearAdaptation(nn.Module):
         stacked_qkv = torch.stack([XQ, XK, XV], dim=2)
         xs = stacked_qkv.permute(3, 0, 1, 2, 4, 5)
 
-        # input: [B, num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
-        # output_hidden_states: [num_mini_batch, B, num_heads, mini_batch_size, head_dim]
-        init_params = self.neural_memory.detach(B)
-        if cache_params is not None:
-            init_params.load_state_dict(cache_params[self.layer_idx])
-        scan_params = dict(combine_fn=self.step, init=init_params, xs=xs)
-        try:
-            last_params, output_hidden_states = scan(
-                **scan_params,
-                checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0
-            )
-        except TypeError:  # Using PyTorch official scan
-            last_params, output_hidden_states = scan(**scan_params)
-        output_hidden_states = output_hidden_states[:, :, :, 0, :, :]  # [num_mini_batch, B, num_heads, chunk_size, head_dim]
+        with self.neural_memory.detached_state(B) as init_params:
+            if cache_params is not None:
+                init_params.load_state_dict(cache_params[self.layer_idx])
 
-        # [B, num_heads, L, C]
-        if cache_params is not None:
-            cache_params.update(last_params.state_dict, self.layer_idx)
+            # input: [B, num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
+            # output_hidden_states: [num_mini_batch, B, num_heads, mini_batch_size, head_dim]
+            scan_params = dict(combine_fn=self.step, init=init_params, xs=xs)
+            try:
+                last_params, output_hidden_states = scan(
+                    **scan_params,
+                    checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0
+                )
+            except TypeError:  # Using PyTorch official scan
+                last_params, output_hidden_states = scan(**scan_params)
+            output_hidden_states = output_hidden_states[:, :, :, 0, :, :]  # [num_mini_batch, B, num_heads, chunk_size, head_dim]
+
+            # [B, num_heads, L, C]
+            if cache_params is not None:
+                cache_params.update(last_params.state_dict, self.layer_idx)
 
         # [num_mini_batch, B, num_heads, mini_batch_size, head_dim] -> [B, num_mini_batch, mini_batch_size, num_heads, head_dim]
         output_hidden_states = output_hidden_states.permute(1, 0, 3, 2, 4)
@@ -860,7 +871,7 @@ class TTTLinearAdaptation(nn.Module):
 
         output_hidden_states = self.post_norm(output_hidden_states)
         output_hidden_states = self.o_proj(output_hidden_states)
-        self.neural_memory.attach()
+
         return output_hidden_states
 
 
@@ -894,6 +905,10 @@ class TTTLinearLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.seq_norm(hidden_states)
+
+        if "attention_mask" in kwargs:
+            logging.warning_once(f"{self.__class__} does not use attention mask, but it is provided. It will be ignored.")
+            kwargs.pop("attention_mask")  # TTTLinear does not use attention mask
 
         # TTT Adaptation Layer
         hidden_states = self.self_adapt(
@@ -1061,8 +1076,9 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if 'attention_mask' in kwargs:
-            kwargs.pop('attention_mask')  # TTTLinear does not use attention mask
+        if "attention_mask" in kwargs:
+            logging.warning_once(f"{self.__class__} does not use attention mask, but it is provided. It will be ignored.")
+            kwargs.pop("attention_mask")  # TTTLinear does not use attention mask
 
         rope_start_pos = 0
         if cache_params is None and use_cache:
