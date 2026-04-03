@@ -73,8 +73,8 @@ class MoRLlamaAttention(LlamaAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
-    
-    
+
+
 class MoRLlamaDecoderLayer(nn.Module):
     """The Mixtures of Depth Block that dynamically which tokens to process in a block.
     Wraps around decoder block to allow for token dropping.
