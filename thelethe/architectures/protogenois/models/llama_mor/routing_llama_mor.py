@@ -1,107 +1,101 @@
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Optional, Tuple
+from dataclasses import dataclass
 
-import copy
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from transformers.processing_utils import Unpack
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.utils import logging
 
-from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache
-from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast
-from model.base_model.modeling_llama import apply_rotary_pos_emb, eager_attention_forward, LlamaAttention
-from util.misc import get_torch_dtype
-
-logger = logging.get_logger(__name__)
+from transformers.modeling_outputs import ModelOutput
 
 
-class MoRLlamaAttention(LlamaAttention):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+class LinearRouter(nn.Module):
+    def __init__(self, config, out_dim=1):
+        super().__init__()
+        self.config = config
+        self.router = nn.Linear(config.hidden_size, out_dim, bias=False)
+        self.router.weight.data.normal_(mean=0.0, std=config.initializer_range)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)            
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    def forward(self, x):
+        return self.router(x)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # This class is for hybrid KV sharing that leverages shared caches 
-            # for inactive positions while updating active ones through actual computation
-            if "selected_tokens" in kwargs:
-                cache_kwargs["selected_tokens"] = kwargs["selected_tokens"]
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
+class MLPRouter(nn.Module):
+    def __init__(self, config, out_dim=1):
+        super().__init__()
+        self.config = config
+        self.router = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(config.hidden_size * 2, out_dim, bias=False)
         )
+        for layer in self.router:
+            if isinstance(layer, nn.Linear):
+                layer.weight.data.normal_(mean=0.0, std=config.initializer_range)
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+    def forward(self, x):
+        return self.router(x)
 
 
-class MoRLlamaDecoderLayer(nn.Module):
+class WideMLPRouter(nn.Module):
+    def __init__(self, config, out_dim=1):
+        super().__init__()
+        self.config = config
+        self.router = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(config.hidden_size * 2, out_dim, bias=False)
+        )
+        for layer in self.router:
+            if isinstance(layer, nn.Linear):
+                layer.weight.data.normal_(mean=0.0, std=config.initializer_range)
+
+    def forward(self, x):
+        return self.router(x)
+
+
+ROUTER_TYPES = {
+    'linear': LinearRouter,
+    'mlp': MLPRouter,
+    'wide_mlp': WideMLPRouter,
+}
+
+
+@dataclass
+class LlamaMorRouterOutputWithPast(ModelOutput):
+    hidden_state: Optional[torch.FloatTensor] = None
+    attention_weights: Optional[torch.FloatTensor] = None
+    selected_tokens: Optional[torch.FloatTensor] = None
+    sampling_loss: Optional[torch.FloatTensor] = None
+    sampling_acc: Optional[torch.FloatTensor] = None
+    sampling_topk_acc: Optional[torch.FloatTensor] = None
+    uniformity: Optional[torch.FloatTensor] = None
+    dead_token_seq: Optional[torch.FloatTensor] = None
+    balancing_loss: Optional[torch.FloatTensor] = None
+    balancing_ratio: Optional[torch.FloatTensor] = None
+    router_z_loss: Optional[torch.FloatTensor] = None
+
+
+class LlamaMorExpertRouter(nn.Module):
     """The Mixtures of Depth Block that dynamically which tokens to process in a block.
     Wraps around decoder block to allow for token dropping.
     """
 
-    def __init__(self, config, block, cfg, capacity_factor=1.0, cap_warmup_step=0,):
+    def __init__(self, config, block, cfg, capacity_factor=1.0, cap_warmup_step=0):
         super().__init__()
         self.mor = True
         self.mor_type = "expert"
-        
+
         self.config = config
         self.block = block
         self.cfg = cfg
         self.capacity_factor = capacity_factor
         self.cap_warmup_step = cap_warmup_step  # warm_up step for capacity_factor
-        
-        torch_dtype = get_torch_dtype(cfg)
-        for blk in self.block:
-            blk.self_attn = MoRLlamaAttention(config, blk.self_attn.layer_idx).to(torch_dtype)
 
         self.training_step = 0
         
         self.router_func = cfg.mor.expert.router_func
         self.alpha = cfg.mor.expert.alpha
         self.sampling = cfg.mor.expert.sampling
-        
-        torch_dtype = get_torch_dtype(cfg)
         
         if not cfg.mor.rand_router:
             self.mor_router = ROUTER_TYPES[cfg.mor.router_type](config).to(torch_dtype)
@@ -310,3 +304,7 @@ class MoRLlamaDecoderLayer(nn.Module):
             balancing_ratio=None,
             router_z_loss=router_z_loss if self.training else None,
         )
+
+
+class LlamaMorTokenRouter(nn.Module):
+    pass
