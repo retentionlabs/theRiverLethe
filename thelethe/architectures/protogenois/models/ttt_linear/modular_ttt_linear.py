@@ -48,7 +48,6 @@
 #
 # Licensed under Apache License, Version 2.0
 from typing import Any, Dict, Optional, Tuple, Union, Unpack, Mapping
-from contextlib import contextmanager
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -56,21 +55,24 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ...utils.scan_ops import scan
-from ...configuration_utils import PretrainedConfig
-from ...modeling_rope_utils import rope_config_validation
-from ...modeling_outputs import ModelOutput, ImageClassifierOutput
-from ...modeling_utils import PreTrainedModel
+from huggingface_hub.dataclasses import strict
+
+from .....ops import scan, compiled_scan
+from ...configuration_utils import PreTrainedConfig
 from ...modeling_layers import (
     GenericForSequenceClassification,
     GenericForTokenClassification,
+    GradientCheckpointingLayer
 )
 from ...generation import GenerationMixin
 from ..llama.modeling_llama import (
     LlamaMLP,
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
-    apply_rotary_pos_emb
+    apply_rotary_pos_emb,
+    LlamaPreTrainedModel,
+    LlamaModel,
+    LlamaForCausalLM
 )
 from ..vit.modeling_vit import ViTForImageClassification
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
@@ -90,106 +92,27 @@ def gelu_derivative(x):
     return ff
 
 
-class TTTLinearConfig(PretrainedConfig):
+@auto_docstring(checkpoint="RetentionLabs/TTT-Linear-1.3B-Base-Pile-8k")
+@strict
+class TTTLinearConfig(PreTrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`TTTModel`]. It is used to instantiate an TTT
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the TTTLinear 1.5B.
-
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
-
-    Args:
-        vocab_size (`int`, *optional*, defaults to 151936):
-            Vocabulary size of the LLaMA model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`LlamaModel`]
-        hidden_size (`int`, *optional*, defaults to 2048):
-            Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 5504):
-            Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 24):
-            Number of hidden layers in the Transformer decoder.
-        num_attention_heads (`int`, *optional*, defaults to 32):
-            Number of attention heads for each attention layer in the Transformer decoder.
-        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
-            The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 4096):
-            The maximum sequence length that this model might ever be used with. Llama 1 supports up to 2048 tokens,
-            Llama 2 up to 4096, CodeLlama up to 16384.
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
-            The epsilon used by the rms normalization layers.
-        mini_batch_eps (`float`, *optional*, defaults to 1e-6):
-            The epsilon used by the mini batch normalization layers.
-        use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models). Only
-            relevant if `config.is_decoder=True`.
-        pad_token_id (`int`, *optional*):
-            Padding token id.
-        bos_token_id (`int`, *optional*, defaults to 1):
-            Beginning of stream token id.
-        eos_token_id (`int`, *optional*, defaults to 2):
-            End of stream token id.
-        pretraining_tp (`int`, *optional*, defaults to 1):
-            Experimental feature. Tensor parallelism rank used during pretraining. Please refer to [this
-            document](https://huggingface.co/docs/transformers/main/perf_train_gpu_many#tensor-parallelism) to understand more about it. This value is
-            necessary to ensure exact reproducibility of the pretraining results. Please refer to [this
-            issue](https://github.com/pytorch/pytorch/issues/76232).
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie weight embeddings
-        rope_theta (`float`, *optional*, defaults to 10000.0):
-            The base period of the RoPE embeddings.
-        rope_scaling (`Dict`, *optional*):
-            Dictionary containing the scaling configuration for the RoPE embeddings. NOTE: if you apply new rope type
-            and you expect the model to work on longer `max_position_embeddings`, we recommend you to update this value
-            accordingly.
-            Expected contents:
-                `rope_type` (`str`):
-                    The sub-variant of RoPE to use. Can be one of ['default', 'linear', 'dynamic', 'yarn', 'longrope',
-                    'llama3'], with 'default' being the original RoPE implementation.
-                `factor` (`float`, *optional*):
-                    Used with all rope types except 'default'. The scaling factor to apply to the RoPE embeddings. In
-                    most scaling types, a `factor` of x will enable the model to handle sequences of length x *
-                    original maximum pre-trained length.
-                `original_max_position_embeddings` (`int`, *optional*):
-                    Used with 'dynamic', 'longrope' and 'llama3'. The original max position embeddings used during
-                    pretraining.
-                `attention_factor` (`float`, *optional*):
-                    Used with 'yarn' and 'longrope'. The scaling factor to be applied on the attention
-                    computation. If unspecified, it defaults to value recommended by the implementation, using the
-                    `factor` field to infer the suggested value.
-                `beta_fast` (`float`, *optional*):
-                    Only used with 'yarn'. Parameter to set the boundary for extrapolation (only) in the linear
-                    ramp function. If unspecified, it defaults to 32.
-                `beta_slow` (`float`, *optional*):
-                    Only used with 'yarn'. Parameter to set the boundary for interpolation (only) in the linear
-                    ramp function. If unspecified, it defaults to 1.
-                `short_factor` (`list[float]`, *optional*):
-                    Only used with 'longrope'. The scaling factor to be applied to short contexts (<
-                    `original_max_position_embeddings`). Must be a list of numbers with the same length as the hidden
-                    size divided by the number of attention heads divided by 2
-                `long_factor` (`list[float]`, *optional*):
-                    Only used with 'longrope'. The scaling factor to be applied to long contexts (<
-                    `original_max_position_embeddings`). Must be a list of numbers with the same length as the hidden
-                    size divided by the number of attention heads divided by 2
-                `low_freq_factor` (`float`, *optional*):
-                    Only used with 'llama3'. Scaling factor applied to low frequency components of the RoPE
-                `high_freq_factor` (`float`, *optional*):
-                    Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
-        adapt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner
-        chunk_size (`int`, *optional*, defaults to 16): chunk size (mini-batch size) for TTT learner
-        scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
-            gradient checkpoint group size on seq dimension, 0 means no checkpointing.
-            In JAX implementation, we set it 4, which means we group 4 chunks together in 1 gradient checkpointg to save memory.
+    adapt_eps (`float`, *optional*, defaults to 1e-6):
+        The epsilon used by the mini batch normalization layers.
+    adapt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner.
+    chunk_size (`int`, *optional*, defaults to 16):
+        chunk size (mini-batch size) for TTT learner.
+        max_position_embeddings will automatically set to chunk_size.
+    scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
+        gradient checkpoint group size on seq dimension, 0 means no checkpointing.
+        In JAX implementation, we set it 4, which means we group 4 chunks together in 1 gradient checkpointg to save memory.
 
     ```python
     >>> from transformers import TTTLinearModel, TTTLinearConfig
 
-    >>> # Initializing a TTT ttt_linear 1.5b style configuration
+    >>> # Initializing a TTTLinear-1.3b style configuration
     >>> configuration = TTTLinearConfig()
 
-    >>> # Initializing a model from the ttt_linear 1.5b style configuration
+    >>> # Initializing a model from the TTTLinear-1.3b style configuration
     >>> model = TTTLinearModel(configuration)
 
     >>> # Accessing the model configuration
@@ -198,64 +121,33 @@ class TTTLinearConfig(PretrainedConfig):
 
     model_type = "ttt_linear"
 
-    def __init__(
-        self,
-        vocab_size=151936,
-        hidden_size=2048,
-        intermediate_size=5504,
-        num_hidden_layers=24,
-        num_attention_heads=32,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        mini_batch_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        pretraining_tp=1,
-        tie_word_embeddings=True,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        mlp_bias=False,
-        adapt_base_lr=1.0,
-        chunk_size=16,
-        scan_checkpoint_group_size=0,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
+    hidden_size: int = 2048
+    intermediate_size: int = 5504
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 32
+    use_cache: bool = True
+    tie_word_embeddings: bool = True
 
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.mini_batch_eps = mini_batch_eps
-        self.pretraining_tp = pretraining_tp
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+    adapt_eps: float = 1e-6
+    adapt_base_lr: float = 1.0
+    chunk_size: int = 16
+    scan_checkpoint_group_size: int = 0
 
-        self.mlp_bias = mlp_bias
-        self.adapt_base_lr = adapt_base_lr
-        self.chunk_size = chunk_size
+    @property
+    def max_position_embeddings(self) -> int:
+        return self.chunk_size
 
-        self.scan_checkpoint_group_size = scan_checkpoint_group_size
+    @property
+    def memory_shape(self) -> str:
+        return "linear"
 
-        self.memory_depth = 1  # TTTLinearAdaptation depth
+    @property
+    def memory_depth(self) -> int:
+        return 1
 
-        rope_config_validation(self)
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+    @property
+    def memory_loss_type(self) -> tuple[str]:
+        return ("momentary", )
 
 
 class TTTLinearCache:
@@ -287,7 +179,7 @@ class TTTLinearCache:
     """
     layer_list_key = "self_adapt"
 
-    def __init__(self, config: PretrainedConfig, batch_size: int, layers: nn.ModuleList, device: torch.device):
+    def __init__(self, config: PreTrainedConfig, batch_size: int, layers: nn.ModuleList, device: torch.device):
         self.chunk_size = config.chunk_size
         self.memory_depth = config.memory_depth
         self.param_names = [f"layers.{i}.weight" for i in range(self.memory_depth)] + [f"layers.{i}.bias" for i in range(self.memory_depth)]
@@ -350,8 +242,7 @@ class TTTSwiGluMLP(LlamaMLP):
 
 
 class TTTRotaryEmbedding(LlamaRotaryEmbedding):
-    def __init__(self, config, device: Optional[torch.device] = None):
-        super().__init__(config, device)
+    pass
 
 
 class TTTMultiheadLayerNorm(nn.Module):
@@ -824,7 +715,7 @@ class TTTLinearAdaptation(nn.Module):
         )
 
 
-class TTTLinearLayer(nn.Module):
+class TTTLinearLayer(GradientCheckpointingLayer):
     def __init__(self, config: TTTLinearConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -872,71 +763,13 @@ class TTTLinearLayer(nn.Module):
         return hidden_states
 
 
-class TTTLinearPreTrainedModel(PreTrainedModel):
-    config_class = TTTLinearConfig
-    base_model_prefix = "ttt_linear"
-    supports_gradient_checkpointing = True
+class TTTLinearPreTrainedModel(LlamaPreTrainedModel):
+    config: TTTLinearConfig
     _no_split_modules = ["TTTLinearLayer"]
-
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
-
-@dataclass
-class TTTLinearOutput(ModelOutput):
-    """
-    Class for the TTT model outputs.
-
-    Args:
-        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-            Sequence of hidden-states at the output of the last layer of the model.
-        cache_params (`TTTLinearCache`):
-            The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
-            avoid providing the old `input_ids`.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-    """
-
-    last_hidden_state: Optional[torch.FloatTensor] = None
-    cache_params: Optional[TTTLinearCache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-
-
-@dataclass
-class TTTLinearCausalLMOutput(ModelOutput):
-    """
-    Base class for causal language model (or autoregressive) outputs.
-
-    Args:
-        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            Language modeling loss (for next-token prediction).
-        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        cache_params (`TTTLinearCache`):
-            The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
-            avoid providing the old `input_ids`.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-    """
-
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    cache_params: Optional[TTTLinearCache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    _can_record_outputs = {
+        "hidden_states": TTTLinearLayer,
+        "attentions": TTTLinearAdaptation,
+    }
 
 
 class TTTLinearModel(TTTLinearPreTrainedModel):
@@ -954,12 +787,6 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
 
     @can_return_tuple
     @auto_docstring
@@ -1095,8 +922,11 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
         )
 
 
+@auto_docstring
 class TTTLinearForCausalLM(TTTLinearPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config: TTTLinearConfig):
         super().__init__(config)
@@ -1107,210 +937,22 @@ class TTTLinearForCausalLM(TTTLinearPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def set_decoder(self, decoder):
-        self.model = decoder
-
-    def get_decoder(self):
-        return self.model
-
-    def _update_model_kwargs_for_generation(
-        self, outputs: ModelOutput, model_kwargs: Dict[str, Any], **kwargs
-    ) -> Dict[str, Any]:
-        model_kwargs['cache_params'] = outputs.get('cache_params', None)
-        return model_kwargs
-
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[TTTLinearCache] = None,
-        mini_batch_size: Optional[int] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        **kwargs,
-    ):
-        if use_cache is None:
-            use_cache = True  # TTTLinear always use cache on generation mode if the user explicitly set it to False
-
-        if use_cache and cache_params is not None:  # Generation with cache
-            past_length = cache_params.token_len if hasattr(cache_params, 'token_len') else 0
-            input_len = input_ids.shape[-1]
-            new_token_len = input_len - past_length
-            if new_token_len > self.config.chunk_size:  # falling back to normal mode
-                pass
-            else:  # auto-regressive generation mode
-                if mini_batch_size is None:
-                    mini_batch_size = new_token_len
-                if input_ids is not None:
-                    input_ids = input_ids[:, -new_token_len].unsqueeze(-1)
-                elif inputs_embeds is not None:
-                    inputs_embeds = inputs_embeds[:, -new_token_len].unsqueeze(-1)
-                else:
-                    raise ValueError("input_ids or inputs_embeds must be specified")
-                if position_ids is not None:
-                    position_ids = position_ids[:, -new_token_len].unsqueeze(-1)
-        else:  # Prefill or non-caching Generation
-            cache_params = None
-            mini_batch_size = None
-
-        if inputs_embeds is not None and cache_params is None:
-            model_inputs = {'inputs_embeds': inputs_embeds}
-        else:
-            model_inputs = {'input_ids': input_ids}
-
-        model_inputs.update({
-            'position_ids': position_ids,
-            'cache_params': cache_params,
-            'mini_batch_size': mini_batch_size,
-            'use_cache': use_cache
-        })
-        return model_inputs
-
-    @can_return_tuple
-    @auto_docstring
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[TTTLinearCache] = None,
-        mini_batch_size: Optional[int] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[Tuple, TTTLinearCausalLMOutput]:
-        """
-        Forward pass through the TTT Linear model for causal language modeling.
-
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Indices of input sequence tokens in the vocabulary.
-            position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Indices of positions of each input sequence token in the position embeddings.
-            cache_params (`TTTLinearCache`, *optional*):
-                Cache object containing fast weights and gradient states for efficient incremental generation.
-                Enables the model to maintain its learned adaptations across generation steps.
-            mini_batch_size (`int`, *optional*):
-                Mini-batch size for TTT learning updates. If None, defaults to config.chunk_size.
-                Smaller values enable more frequent adaptation but may be less stable.
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-            use_cache (`bool`, *optional*):
-                If set to `True`, cache_params is returned and can be used to speed up decoding.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a ModelOutput instead of a plain tuple.
-            **kwargs:
-                Additional keyword arguments passed to the underlying model.
-
-        Returns:
-            `Union[Tuple, TTTLinearCausalLMOutput]`:
-                Either a tuple or TTTLinearCausalLMOutput containing:
-                - loss: Language modeling loss (if labels provided)
-                - logits: Prediction scores for each vocabulary token
-                - cache_params: Updated cache with fast weights and states
-                - hidden_states: Hidden states of all layers (if requested)
-        """
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: TTTLinearOutput = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            cache_params=cache_params,
-            mini_batch_size=mini_batch_size,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            **kwargs,
-        )
-
-        hidden_states = outputs.last_hidden_state
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
-            logits = self.lm_head(hidden_states)
-        logits = logits.float()
-
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        return TTTLinearCausalLMOutput(
-            loss=loss,
-            logits=logits,
-            cache_params=outputs.cache_params,
-            hidden_states=outputs.hidden_states,
-        )
-
-
-class TTTLinearForSequenceClassification(GenericForSequenceClassification, TTTLinearPreTrainedModel):
+@auto_docstring
+class TTTLinearForSequenceClassification(TTTLinearPreTrainedModel, GenericForSequenceClassification):
     pass
 
 
-class TTTLinearForTokenClassification(GenericForTokenClassification, TTTLinearPreTrainedModel):
+@auto_docstring
+class TTTLinearForTokenClassification(TTTLinearPreTrainedModel, GenericForTokenClassification):
     pass
 
 
-class TTTLinearForImageClassification(ViTForImageClassification):
+@auto_docstring
+class TTTLinearForImageClassification(TTTLinearPreTrainedModel, ViTForImageClassification):
     def __init__(self, config):
         super().__init__(config)
         self.vit = TTTLinearModel(config)  # TODO: Add patch config and patch embedding
-
-    def forward(
-        self,
-        pixel_values: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        interpolate_pos_encoding: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[tuple, ImageClassifierOutput]:
-        return super().forward(
-            pixel_values, head_mask, labels,
-            output_attentions, output_hidden_states,
-            interpolate_pos_encoding, return_dict
-        )
 
 
 __all__ = [

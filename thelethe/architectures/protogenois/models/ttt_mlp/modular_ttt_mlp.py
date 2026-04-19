@@ -49,7 +49,7 @@
 # Licensed under Apache License, Version 2.0
 from torch import nn
 
-from ...modeling_layers import (
+from .....transformers.modeling_layers import (
     GenericForSequenceClassification,
     GenericForTokenClassification,
 )
@@ -74,7 +74,7 @@ from ..ttt_linear.modeling_ttt_linear import (
     TTTLinearForImageClassification
 )
 
-from ...utils import logging
+from .....utils import logging
 
 
 logger = logging.get_logger(__name__)

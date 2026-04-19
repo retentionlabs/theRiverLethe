@@ -6,11 +6,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from transformers.modeling_layers import (
+from ...modeling_layers import (
     GenericForSequenceClassification,
     GenericForTokenClassification,
 )
-from transformers.models.ttt_linear.modeling_ttt_linear import (
+from ....protogenois.models.ttt_linear.modeling_ttt_linear import (
     TTTLinearCache,
     TTTRMSNorm,
     TTTSwiGluMLP,
@@ -32,8 +32,8 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3DecoderLayer
 from ...configuration_utils import PretrainedTitansConfig, TitansVariants, layer_type_validation
 from ...modeling_rope_utils import rope_config_validation
 from ...modeling_utils import PreTrainedTitansModel
-from .....utils.scan_ops import associative_scan
-from .....utils import logging
+from .....ops.scan_ops import associative_scan
+from ...utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -538,7 +538,7 @@ class OriginAdaptation(TTTLinearAdaptation):
 
 
 class OriginRetention(OriginAdaptation):
-    """ Self-retention
+    """ Self-Retention
     The self-adaptation layer changes its role to memory retention when implemented in the "Memory As ??" pattern.
     """
     pass

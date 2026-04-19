@@ -1,6 +1,7 @@
-from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+from transformers.configuration_utils import PreTrainedConfig, layer_type_validation
 from transformers.models.auto.configuration_auto import AutoConfig
-from ...utils import logging
+
+from transformers.configuration_utils import *
 
 from typing import Literal
 from enum import Enum
@@ -14,7 +15,7 @@ class TitansVariants(Enum):
     MAL = "mal"  # Memory As Layer
 
 
-class PretrainedTitansConfig(PretrainedConfig):
+class PretrainedTitansConfig(PreTrainedConfig):
     """
     This is the configuration class to store the configuration of a `PretrainedTitansModel`.
     It is used to instantiate a PretrainedTitans model according to the specified arguments, defining the model architecture.
@@ -25,7 +26,7 @@ class PretrainedTitansConfig(PretrainedConfig):
     def __init__(
         self,
         variant: TitansVariants | Literal["lmm", "mac", "mae", "mag", "mal"] = TitansVariants.LMM,
-        memory_depth: int = 4,
+        memory_depth: int = 2,
         pad_token_id: int | None = None,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -49,4 +50,20 @@ class PretrainedTitansConfig(PretrainedConfig):
 
 
 class AutoTitansConfig(AutoConfig):
+    pass
+
+
+class AutoMacConfig(AutoTitansConfig):
+    pass
+
+
+class AutoMaeConfig(AutoTitansConfig):
+    pass
+
+
+class AutoMagConfig(AutoTitansConfig):
+    pass
+
+
+class AutoMalConfig(AutoTitansConfig):
     pass

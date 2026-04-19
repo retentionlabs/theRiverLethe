@@ -1,4 +1,4 @@
-from ...modelings import PreTrainedTitansModel
+from ...modeling_utils import PreTrainedTitansModel
 from .configuration_cronos import CronosConfig
 
 
