@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "transformers>=5.4.0",
+    "transformers>=5.5.4",
 ]
 [project.optional-dependencies]
 dev = [
@@ -35,6 +35,10 @@ dev = [
 torch = [
     "torch ; platform_system == 'Windows'",
     "torch>=2.8.0",
+]
+flash = [
+    "flash-attention>=1.0.0",
+    "flash-linear-attention>=0.4.2"
 ]
 
 [project.urls]
